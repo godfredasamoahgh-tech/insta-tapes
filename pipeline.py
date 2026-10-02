@@ -1324,7 +1324,7 @@ def phase_comments_deep(posts, page_src):
             continue
         fetched_extra = []
         cursor = None
-        for _ in range(40):
+        for _ in range(120):
             variables = {"media_id": str(media_id), "first": 50, "last": None,
                          "before": None, "sort_order": "popular", "after": cursor,
                          "__relay_internal__pv__PolarisIsLoggedInrelayprovider": False}
@@ -1395,7 +1395,7 @@ def phase_comments_deep(posts, page_src):
                     stack.extend(cur)
             if not cursor:
                 break
-            time.sleep(0.6)
+            time.sleep(0.45)
         if fetched_extra:
             have_ids = {c.get("id") for c in rec["comments"]}
             add_n = 0
@@ -1408,6 +1408,91 @@ def phase_comments_deep(posts, page_src):
                 rec["comment_count_found"] = len(rec["comments"])
                 deep_ok += 1
                 log("COMMENTS", "%s +%d -> %d/%s" % (rec["code"], add_n, len(rec["comments"]), want))
+        # pass 2: sort=recent catches what popular sort hid (union merge)
+        if rec["comment_count_found"] < want:
+            fetched_extra = []
+            cursor = None
+            for _ in range(80):
+                variables = {"media_id": str(media_id), "first": 50, "last": None,
+                             "before": None, "sort_order": "recent", "after": cursor,
+                             "__relay_internal__pv__PolarisIsLoggedInrelayprovider": False}
+                body = urllib.parse.urlencode({
+                    "lsd": lsd,
+                    "fb_api_req_friendly_name": "PolarisPostCommentsPaginationQuery",
+                    "variables": json.dumps(variables, separators=(",", ":")),
+                    "doc_id": doc_id,
+                })
+                try:
+                    rr = S.post("https://www.instagram.com/api/graphql", data=body, timeout=40, headers={
+                        "User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+                        "x-ig-app-id": WEB_APP_ID,
+                        "content-type": "application/x-www-form-urlencoded",
+                        "X-FB-LSD": lsd, "X-CSRFToken": csrf,
+                        "Origin": "https://www.instagram.com",
+                        "Referer": rec.get("url") or "https://www.instagram.com/",
+                    })
+                    j = rr.json()
+                except Exception:
+                    break
+                edges = []
+                stack = [j.get("data") or {}]
+                while stack and not edges:
+                    cur = stack.pop()
+                    if isinstance(cur, dict):
+                        if isinstance(cur.get("edges"), list) and cur["edges"] and isinstance(cur["edges"][0], dict) and "node" in cur["edges"][0]:
+                            edges = cur["edges"]
+                        else:
+                            stack.extend(cur.values())
+                    elif isinstance(cur, list):
+                        stack.extend(cur)
+                if not edges:
+                    break
+                for e in edges:
+                    node = e.get("node") or {}
+                    rps = []
+                    for key in ("threaded_comments", "edge_threaded_comments", "replies"):
+                        rep = node.get(key)
+                        if isinstance(rep, dict):
+                            for re_ in (rep.get("edges") or []):
+                                rn = re_.get("node") or {}
+                                ru = rn.get("user") or rn.get("owner") or {}
+                                rps.append({"user": ru.get("username") or "?",
+                                            "text": rn.get("text") or "",
+                                            "likes": rn.get("comment_like_count") or rn.get("like_count") or 0})
+                    fetched_extra.append({
+                        "user": (node.get("user") or node.get("owner") or {}).get("username") or "?",
+                        "text": node.get("text") or "",
+                        "likes": node.get("comment_like_count") or node.get("like_count") or 0,
+                        "id": str(node.get("id") or node.get("pk") or ""),
+                        "replies": rps,
+                    })
+                cursor = None
+                stack = [j.get("data") or {}]
+                while stack and not cursor:
+                    cur = stack.pop()
+                    if isinstance(cur, dict):
+                        pi = cur.get("page_info") or cur.get("paging_info")
+                        if isinstance(pi, dict) and pi.get("has_next_page") and pi.get("end_cursor"):
+                            cursor = pi["end_cursor"]
+                        else:
+                            stack.extend(cur.values())
+                    elif isinstance(cur, list):
+                        stack.extend(cur)
+                if not cursor:
+                    break
+                time.sleep(0.45)
+            if fetched_extra:
+                have_ids = {c.get("id") for c in rec["comments"]}
+                add_n = 0
+                for c in fetched_extra:
+                    if c["id"] not in have_ids:
+                        rec["comments"].append(c)
+                        have_ids.add(c["id"])
+                        add_n += 1
+                if add_n:
+                    rec["comment_count_found"] = len(rec["comments"])
+                    deep_ok += 1
+                    log("COMMENTS", "%s recent +%d -> %d/%s" % (rec["code"], add_n, len(rec["comments"]), want))
         time.sleep(0.5)
     log("COMMENTS", "deep-paginated posts=%d" % deep_ok)
 
