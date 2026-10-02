@@ -638,6 +638,187 @@ def phase_profile_v3():
             add(c2.get("code"), c2.get("type") or "p")
     return codes
 
+def phase_profile_v4():
+    """Discover current grid doc_id from WORKING post-page bundles, then run a
+    variables/headers matrix until the timeline connection returns edges."""
+    global GRID_INFO
+    username = ""
+    m_u = re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", PROFILE_URL)
+    if m_u:
+        username = m_u.group(1)
+    codes = []
+    def add(code, typ="p"):
+        if code and code not in ("en_US", "us", "web", "login") and \
+           not any(c["code"] == code for c in codes):
+            codes.append({"code": code, "type": typ})
+
+    # cookie prime (anon visit sets ig_did/csrftoken)
+    try:
+        rp = S.get("https://www.instagram.com/", timeout=30)
+        print("PHASE1|prime cookies=%s status=%d" % (list(S.cookies.keys())[:6], rp.status_code), flush=True)
+    except Exception as e:
+        print("PHASE1|prime ERR %s" % str(e)[:80], flush=True)
+
+    # A) discovery from a seed post page (anon-readable per proven skill)
+    discovered = []
+    seed = None
+    for sc in ("DWCCNE-jo12", "Dd7XBExRZQy", "DdvDpgnTEt3"):
+        r = http_get("https://www.instagram.com/p/%s/" % sc, tries=2)
+        if r and r.status_code == 200 and "login" not in (r.url or ""):
+            seed = r.text
+            print("PHASE1|seed page %s len=%d" % (sc, len(seed)), flush=True)
+            break
+    if seed:
+        js_refs = []
+        for u in re.findall(r'src="([^"]+\.js)"', seed):
+            if u.startswith("//"): u = "https:" + u
+            elif u.startswith("/"): u = "https://www.instagram.com" + u
+            if u.startswith("http"): js_refs.append(u)
+        js_refs = list(dict.fromkeys(js_refs))
+        print("PHASE1|seed bundles=%d" % len(js_refs), flush=True)
+        tl_hits = 0
+        for bu in js_refs[:24]:
+            try:
+                rb = S.get(bu, timeout=25)
+                if rb.status_code != 200: continue
+                body = rb.text
+                found = re.findall(r'doc_id["\']?\s*[:=]\s*["\']?(\d{8,20})', body)
+                if "timelinegraphql" in body:
+                    tl_hits += 1
+                    for mm in re.finditer(r'timelinegraphql', body):
+                        win = body[max(0, mm.start() - 600): mm.start() + 600]
+                        found += re.findall(r'\b(\d{15,19})\b', win)
+                    print("PHASE1|TIMELINE-BUNDLE %s docids=%s" % (bu[-60:], found[:6]), flush=True)
+                discovered += found
+            except Exception:
+                pass
+        discovered = list(dict.fromkeys(discovered))
+        print("PHASE1|discovered doc_ids=%d %s | timeline bundles=%d" %
+              (len(discovered), discovered[:8], tl_hits), flush=True)
+
+    docs = ["9310670392322965"] + [d for d in discovered if d != "9310670392322965"][:8]
+    def full_vars(count):
+        return {"after": None, "before": None,
+                "data": {"count": count, "include_reel_media_seen_timestamp": True,
+                         "include_relationship_info": True,
+                         "latest_besties_reel_media": True, "latest_reel_media": True},
+                "first": count, "last": None, "username": username,
+                "__relay_internal_pv__PolarisIsLoggedInrelayprovider": True,
+                "__relay_internal_pv__PolarisShareSheetV3relayprovider": True}
+    base_h = {"content-type": "application/x-www-form-urlencoded",
+              "Accept-Language": "en-US,en;q=0.9", "Referer": PROFILE_URL}
+    variants = [
+        ("g12-noid", dict(**base_h), full_vars(12)),
+        ("g12-app1", dict(**base_h, **{"x-ig-app-id": IG_APP_ID}), full_vars(12)),
+        ("g12-app2", dict(**base_h, **{"x-ig-app-id": "936619743392459"}), full_vars(12)),
+        ("min12", dict(**base_h), {"username": username, "first": 12}),
+    ]
+    def find_conn(o):
+        if isinstance(o, dict):
+            if "edges" in o and "page_info" in o: return o
+            for v in o.values():
+                got = find_conn(v)
+                if got: return got
+        elif isinstance(o, list):
+            for v in o:
+                got = find_conn(v)
+                if got: return got
+        return None
+
+    picked = None
+    chosen_vars = None
+    for doc in docs:
+        for vname, hdrs, vv in variants:
+            params = {"doc_id": doc, "variables": json.dumps(vv, separators=(",", ":"))}
+            url = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(params)
+            r = http_get(url, ua=False, tries=1, headers=hdrs)
+            if not r:
+                print("PHASE1|MX %s doc=%s -> NOCONN" % (vname, doc), flush=True); continue
+            try:
+                j = r.json()
+            except Exception:
+                print("PHASE1|MX %s doc=%s -> %d nonjson %r" %
+                      (vname, doc, r.status_code, r.text[:90]), flush=True); continue
+            conn = find_conn(j)
+            ok = bool(conn and conn.get("edges"))
+            print("PHASE1|MX %s doc=%s -> %d edges=%s body=%s" %
+                  (vname, doc, r.status_code, ok, str(j)[:160]), flush=True)
+            if ok:
+                picked = doc
+                chosen_vars = vv
+                break
+        if picked:
+            break
+
+    if not picked:
+        print("PHASE1|matrix empty — falling back to v3 chain", flush=True)
+        for c2 in phase_profile_v3():
+            add(c2.get("code"), c2.get("type") or "p")
+        return codes
+
+    # C) paginate with the winning doc+vars
+    variables = chosen_vars
+    prev_cursor = None
+    for rnd in range(60):
+        params = {"doc_id": picked,
+                  "variables": json.dumps(variables, separators=(",", ":"))}
+        url = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(params)
+        r = http_get(url, ua=False, tries=2, headers=dict(**base_h,
+                    **{"x-ig-app-id": IG_APP_ID}))
+        if not r or r.status_code != 200:
+            print("PHASE1|page HTTP %s" % (r.status_code if r else "?"), flush=True); break
+        try:
+            j = r.json()
+        except Exception:
+            break
+        conn = find_conn(j)
+        if not conn or not conn.get("edges"):
+            print("PHASE1|page empty %s" % str(j)[:200], flush=True); break
+        n0 = len(codes)
+        for e in conn["edges"]:
+            nd = e.get("node") or {}
+            c = nd.get("code") or nd.get("shortcode") or ""
+            if not c: continue
+            vurls = []
+            vv = nd.get("video_versions")
+            if isinstance(vv, dict):
+                vurls = [x.get("url") for x in (vv.get("candidates") or []) if x.get("url")]
+            elif isinstance(vv, list):
+                vurls = [x.get("url") for x in vv if isinstance(x, dict) and x.get("url")]
+            cap = nd.get("caption")
+            if isinstance(cap, dict): cap = cap.get("text") or ""
+            im = nd.get("image_versions2") or {}
+            iurl = ""
+            if isinstance(im, dict):
+                cands = im.get("candidates") or []
+                if cands: iurl = cands[0].get("url") or ""
+            typename = str(nd.get("__typename") or nd.get("media_type") or "")
+            typ = "reel" if ("Reel" in typename or typename == "2") else "p"
+            GRID_INFO[c] = {"video_urls": [u for u in vurls if u],
+                            "image_url": iurl or nd.get("display_uri") or "",
+                            "captions": [cap] if cap else [],
+                            "likes": nd.get("like_count"),
+                            "taken_at": nd.get("taken_at"),
+                            "comments_count": nd.get("comment_count")}
+            add(c, typ)
+        pi = conn.get("page_info") or {}
+        print("PHASE1|page r%d +%d total=%d next=%s" %
+              (rnd, len(codes) - n0, len(codes), bool(pi.get("has_next_page"))), flush=True)
+        if not pi.get("has_next_page") or not pi.get("end_cursor"):
+            break
+        if pi.get("end_cursor") == prev_cursor:
+            print("PHASE1|cursor stall", flush=True); break
+        prev_cursor = pi.get("end_cursor")
+        variables = dict(variables)
+        variables["after"] = pi.get("end_cursor")
+        time.sleep(0.4)
+
+    for sc in ["Dd7XBExRZQy", "DdvDpgnTEt3", "Ddt9JrXCLVq", "DWCCNE-jo12",
+               "DdSG5a2oTs4", "DYOBxV2xGgJ", "DYpuXTckf0F"]:
+        add(sc, "p")
+    print("PHASE1|TOTAL codes=%d (v4)" % len(codes), flush=True)
+    return codes
+
 # ---------------- PHASE 2: per-post page ----------------
 def phase_posts(codes):
     posts = []
@@ -987,7 +1168,7 @@ def write_outputs(posts):
 # ---------------- main ----------------
 def main():
     log("RUN", "profile=%s" % PROFILE_URL)
-    codes = phase_profile_v3()
+    codes = phase_profile_v4()
     if not codes:
         log("FATAL", "no posts discovered — see strategies in log")
         sys.exit(2)
