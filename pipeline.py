@@ -655,8 +655,11 @@ def phase_profile_v4():
     # cookie prime (anon visit sets ig_did/csrftoken)
     try:
         rp = S.get("https://www.instagram.com/", timeout=30)
-        print("PHASE1|prime cookies=%s status=%d" % (list(S.cookies.keys())[:6], rp.status_code), flush=True)
+        CLAIM = rp.headers.get("x-ig-set-www-claim", "") or ""
+        print("PHASE1|prime cookies=%s status=%d claim=%s" %
+              (list(S.cookies.keys())[:6], rp.status_code, bool(CLAIM)), flush=True)
     except Exception as e:
+        CLAIM = ""
         print("PHASE1|prime ERR %s" % str(e)[:80], flush=True)
 
     # A) discovery from a seed post page (anon-readable per proven skill)
@@ -667,10 +670,14 @@ def phase_profile_v4():
         if r and r.status_code == 200 and "login" not in (r.url or ""):
             seed = r.text
             print("PHASE1|seed page %s len=%d" % (sc, len(seed)), flush=True)
+            page_docs = re.findall(r'doc_id["\']?\s*[:=]\s*["\']?(\d{8,20})', seed)
+            if page_docs:
+                discovered += list(dict.fromkeys(page_docs))
+                print("PHASE1|seed page doc_ids=%s" % page_docs[:8], flush=True)
             break
     if seed:
         js_refs = []
-        for u in re.findall(r'src="([^"]+\.js)"', seed):
+        for u in re.findall(r'(?:src|href)=["\']([^"\']+\.js[^"\']*)["\']', seed):
             if u.startswith("//"): u = "https:" + u
             elif u.startswith("/"): u = "https://www.instagram.com" + u
             if u.startswith("http"): js_refs.append(u)
@@ -712,6 +719,9 @@ def phase_profile_v4():
         ("g12-app1", dict(**base_h, **{"x-ig-app-id": IG_APP_ID}), full_vars(12)),
         ("g12-app2", dict(**base_h, **{"x-ig-app-id": "936619743392459"}), full_vars(12)),
         ("min12", dict(**base_h), {"username": username, "first": 12}),
+        ("full-h", dict(**base_h, **{"x-ig-app-id": IG_APP_ID, "x-asbd-id": ASBD,
+                                     "x-ig-www-claim": CLAIM,
+                                     "Origin": "https://www.instagram.com"}), full_vars(12)),
     ]
     def find_conn(o):
         if isinstance(o, dict):
@@ -751,9 +761,93 @@ def phase_profile_v4():
             break
 
     if not picked:
-        print("PHASE1|matrix empty — falling back to v3 chain", flush=True)
-        for c2 in phase_profile_v3():
-            add(c2.get("code"), c2.get("type") or "p")
+        # discriminator: garbage doc vs our doc — different error = our doc valid-ish
+        try:
+            params = {"doc_id": "1111111111111111",
+                      "variables": json.dumps(full_vars(12), separators=(",", ":"))}
+            url = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(params)
+            rg = http_get(url, ua=False, tries=1,
+                          headers=dict(**base_h, **{"x-ig-app-id": IG_APP_ID}))
+            print("PHASE1|GARBAGE-DOC -> %s" %
+                  (str(rg.json())[:200] if rg else "NOCONN"), flush=True)
+        except Exception as e:
+            print("PHASE1|GARBAGE-DOC ERR %s" % str(e)[:80], flush=True)
+
+        # mobile private-API feed (uid from seed page) — anon-capable historically
+        if seed:
+            uid = None
+            for pat in (r'"owner"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)"',
+                        r'"pk"\s*:\s*"(\d{6,15})"',
+                        r'"user_id"\s*:\s*"(\d{6,15})"',
+                        r'"id"\s*:\s*"(\d{15,20})"'):
+                mu = re.search(pat, seed)
+                if mu:
+                    uid = mu.group(1)
+                    break
+            print("PHASE1|mobile uid=%s" % uid, flush=True)
+            if uid:
+                mh = {"User-Agent": "Instagram 300.0.0.0.0 Android (33/13; 420dpi; "
+                                    "1080x2400; Xiaomi; 21081111RG; vayu; qcom; en_US; 501234567)",
+                      "x-ig-app-id": "567067343352427"}
+                max_id = ""
+                for mr in range(30):
+                    try:
+                        mu2 = ("https://i.instagram.com/api/v1/feed/user/%s/usernamefeed/?count=30%s"
+                               % (uid, ("&max_id=" + max_id) if max_id else ""))
+                        rm = S.get(mu2, timeout=30, headers=mh)
+                        jm = rm.json()
+                        items = jm.get("items") or []
+                        print("PHASE1|mobile r%d -> %d items head=%s" %
+                              (mr, len(items), str(jm)[:120] if not items else ""), flush=True)
+                        if not items:
+                            break
+                        for nd in items:
+                            c = nd.get("code") or ""
+                            if not c:
+                                continue
+                            mt = nd.get("media_type")
+                            typ = "reel" if mt == 2 else "p"
+                            vurls = []
+                            vv = nd.get("video_versions")
+                            if isinstance(vv, dict):
+                                vurls = [x.get("url") for x in (vv.get("candidates") or [])
+                                         if x.get("url")]
+                            elif isinstance(vv, list):
+                                vurls = [x.get("url") for x in vv
+                                         if isinstance(x, dict) and x.get("url")]
+                            im2 = nd.get("image_versions2") or {}
+                            iurl = ""
+                            if isinstance(im2, dict) and (im2.get("candidates") or []):
+                                iurl = im2["candidates"][0].get("url") or ""
+                            capm = nd.get("caption")
+                            if isinstance(capm, dict):
+                                capm = capm.get("text") or ""
+                            GRID_INFO[c] = {"video_urls": vurls, "image_url": iurl,
+                                            "captions": [capm] if capm else [],
+                                            "likes": nd.get("like_count"),
+                                            "taken_at": nd.get("taken_at"),
+                                            "comments_count": nd.get("comment_count")}
+                            add(c, typ)
+                        if jm.get("more_available") and jm.get("next_max_id") and items:
+                            max_id = str(jm["next_max_id"])
+                            time.sleep(0.4)
+                            continue
+                        break
+                    except Exception as e:
+                        print("PHASE1|mobile ERR %s" % str(e)[:100], flush=True)
+                        break
+
+        if len(codes) > 7:
+            print("PHASE1|mobile/grid gave %d codes; skipping pagination" % len(codes), flush=True)
+        else:
+            print("PHASE1|matrix empty — falling back to v3 chain", flush=True)
+            for c2 in phase_profile_v3():
+                add(c2.get("code"), c2.get("type") or "p")
+        # seeds + return (C-pagination only runs when a grid doc won)
+        for sc in ["Dd7XBExRZQy", "DdvDpgnTEt3", "Ddt9JrXCLVq", "DWCCNE-jo12",
+                   "DdSG5a2oTs4", "DYOBxV2xGgJ", "DYpuXTckf0F"]:
+            add(sc, "p")
+        print("PHASE1|TOTAL codes=%d (v4-nodegrid)" % len(codes), flush=True)
         return codes
 
     # C) paginate with the winning doc+vars
@@ -854,21 +948,118 @@ def phase_posts(codes):
             continue
         page = r.text
         rec = {"code": code, "url": url}
-        # media: carousel_media literal array first (Law 25: authoritative array)
-        seq = []
-        m = re.search(r'"carousel_media"\s*:\s*\[', page)
-        if m:
-            blk = match_block(page, page.index("[", m.start()), "[", "]")
-            if blk:
-                try:
-                    seq = json.loads(blk)
-                except Exception:
-                    seq = []
-        if not seq:
-            # single media: video_versions / image_versions2 directly
-            single = grab_json(page, r'"video_versions"')
-            if isinstance(single, dict):
-                seq = [single.get("video_versions") and {"video_versions": single} or single]
+        # ---------- media: modern data-sjs xig_polaris_media (2026 shape) ----------
+        def _collect_videos(o):
+            found = []
+            if isinstance(o, dict):
+                vv = o.get("video_versions")
+                if isinstance(vv, dict):
+                    cands = vv.get("candidates") or ([vv] if vv.get("url") else [])
+                    found += [c.get("url") for c in cands
+                              if isinstance(c, dict) and c.get("url")]
+                vurl = o.get("video_url")
+                if isinstance(vurl, str) and vurl.startswith("http"):
+                    found.append(vurl)
+                for v in o.values():
+                    found += _collect_videos(v)
+            elif isinstance(o, list):
+                for v in o:
+                    found += _collect_videos(v)
+            return found
+
+        media = None
+        for sjs in re.findall(r'<script[^>]*data-sjs[^>]*>(.*?)</script>', page, re.S):
+            if '"xig_polaris_media"' not in sjs:
+                continue
+            try:
+                payload = json.loads(sjs)
+                modules = payload["require"][0][3][0]["__bbox"]["require"]
+            except Exception:
+                continue
+            for module in modules:
+                if not isinstance(module, list) or len(module) <= 3:
+                    continue
+                for entry in module[3]:
+                    if not isinstance(entry, dict):
+                        continue
+                    mm = (entry.get("__bbox", {}) or {}).get("result", {}) or {}
+                    mm = (mm.get("data", {}) or {}).get("xig_polaris_media")
+                    if mm:
+                        media = mm
+                        break
+                if media:
+                    break
+            if media:
+                break
+
+        videos = []
+        images = 0
+        modern_ok = False
+        if isinstance(media, dict):
+            modern_ok = True
+            post = media.get("if_not_gated_logged_out") or media
+            arr = media.get("carousel_media") or \
+                (post.get("carousel_media") if isinstance(post, dict) else None) or \
+                ([post] if isinstance(post, dict) else [])
+            for it in arr:
+                if not isinstance(it, dict):
+                    continue
+                got = _collect_videos(it)
+                if got:
+                    videos += got
+                elif it.get("image_versions2"):
+                    images += 1
+            if not videos:
+                videos = _collect_videos(media)
+            cobj = post.get("caption") if isinstance(post, dict) else None
+            if isinstance(cobj, dict) and cobj.get("text"):
+                rec["caption"] = str(cobj["text"])[:4000]
+            elif isinstance(cobj, str) and cobj:
+                rec["caption"] = cobj[:4000]
+            if isinstance(post, dict):
+                for k in ("taken_at", "like_count", "comment_count"):
+                    if post.get(k) is not None:
+                        rec[k] = post[k]
+            cc = media.get("comments_connection")
+            if not isinstance(cc, dict) and isinstance(post, dict):
+                cc = post.get("comments_connection")
+            if isinstance(cc, dict):
+                coms = []
+                for e in (cc.get("edges") or []):
+                    nd = e.get("node") or {}
+                    us = nd.get("user") or {}
+                    cnode = {"user": us.get("username") or "?",
+                             "text": nd.get("text") or "",
+                             "likes": nd.get("comment_like_count") or 0,
+                             "id": str(nd.get("id") or nd.get("pk") or ""),
+                             "replies": []}
+                    rep = nd.get("threaded_comments") or nd.get("edge_threaded_comments") or {}
+                    for re_ in (rep.get("edges") or []):
+                        rn = re_.get("node") or {}
+                        ru = rn.get("user") or rn.get("owner") or {}
+                        cnode["replies"].append({
+                            "user": ru.get("username") or "?",
+                            "text": rn.get("text") or "",
+                            "likes": rn.get("comment_like_count") or rn.get("like_count") or 0})
+                    coms.append(cnode)
+                rec["comments"] = coms
+                rec["comment_count_found"] = len(coms)
+
+        if not modern_ok:
+            # legacy pre-2026 shapes (Law 25: literal arrays first)
+            seq = []
+            m = re.search(r'"carousel_media"\s*:\s*\[', page)
+            if m:
+                blk = match_block(page, page.index("[", m.start()), "[", "]")
+                if blk:
+                    try:
+                        seq = json.loads(blk)
+                    except Exception:
+                        seq = []
+            if not seq:
+                single = grab_json(page, r'"video_versions"')
+                if isinstance(single, dict):
+                    seq = [single]
             if not seq:
                 info = grab_json(page, r'"xdt_api__v1__media__shortcode__web_info"')
                 if isinstance(info, dict):
@@ -877,42 +1068,49 @@ def phase_posts(codes):
                         seq = med["carousel_media"]
                     elif med:
                         seq = [med]
-        videos = []
-        images = 0
-        for it in seq:
-            if not isinstance(it, dict):
-                continue
-            vv = it.get("video_versions") or (it.get("video_url") and {"candidates": [{"url": it.get("video_url")}]} or None)
-            if vv and (vv.get("candidates") or vv.get("url")):
-                cands = vv.get("candidates") or [vv]
-                u = cands[0].get("url")
-                if u:
-                    videos.append(u)
-            elif it.get("image_versions2"):
-                images += 1
+            for it in seq:
+                if not isinstance(it, dict):
+                    continue
+                vv = it.get("video_versions") or (it.get("video_url") and
+                      {"candidates": [{"url": it.get("video_url")}]} or None)
+                if vv and (vv.get("candidates") or vv.get("url")):
+                    cands = vv.get("candidates") or [vv]
+                    u = cands[0].get("url")
+                    if u:
+                        videos.append(u)
+                elif it.get("image_versions2"):
+                    images += 1
+            cap = grab_json(page, r'"caption"\s*:\s*\{')
+            if isinstance(cap, dict):
+                rec["caption"] = (cap.get("text") or "")[:4000]
+            for key, anchor in (("taken_at", r'"taken_at"\s*:\s*'), ("like_count", r'"like_count"\s*:\s*'),
+                                ("comment_count", r'"comment_count"\s*:\s*')):
+                m2 = re.search(anchor + r'(\d+)', page)
+                if m2:
+                    rec[key] = int(m2.group(1))
+            coms, total_got = parse_comments(page)
+            rec["comments"] = coms
+            rec["comment_count_found"] = total_got
+
         if not videos and GRID_INFO.get(code, {}).get("video_urls"):
             videos = list(GRID_INFO[code]["video_urls"])
             log("POST", "%s video url from grid node" % code)
-        rec["videos"] = videos
-        rec["images"] = images
-        # caption
-        cap = grab_json(page, r'"caption"\s*:\s*\{')
-        if isinstance(cap, dict):
-            rec["caption"] = (cap.get("text") or "")[:4000]
-        elif GRID_INFO.get(code, {}).get("captions"):
+        if "caption" not in rec and GRID_INFO.get(code, {}).get("captions"):
             rec["caption"] = (GRID_INFO[code]["captions"][0] or "")[:4000]
-        # meta timestamp/likes/comments
         for key, anchor in (("taken_at", r'"taken_at"\s*:\s*'), ("like_count", r'"like_count"\s*:\s*'),
                             ("comment_count", r'"comment_count"\s*:\s*')):
-            m2 = re.search(anchor + r'(\d+)', page)
-            if m2:
-                rec[key] = int(m2.group(1))
-        # comments: parent + threaded replies (embedded)
-        coms, total_got = parse_comments(page)
-        rec["comments"] = coms
-        rec["comment_count_found"] = total_got
+            if rec.get(key) is None:
+                m2 = re.search(anchor + r'(\d+)', page)
+                if m2:
+                    rec[key] = int(m2.group(1))
+        rec["videos"] = videos
+        rec["images"] = images
+        if "comments" not in rec:
+            rec["comments"] = []
+        if "comment_count_found" not in rec:
+            rec["comment_count_found"] = 0
         log("POST", "%d/%d %s videos=%d comments=%d/%s" %
-            (i, n, code, len(videos), total_got, rec.get("comment_count", "?")))
+            (i, n, code, len(videos), rec["comment_count_found"], rec.get("comment_count", "?")))
         posts.append(rec)
         time.sleep(0.8)
     return posts
