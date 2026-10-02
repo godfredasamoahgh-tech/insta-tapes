@@ -246,6 +246,142 @@ def phase_profile():
     log("PHASE1", "TOTAL codes=%d strategies=%s" % (len(codes), strategies))
     return codes
 
+def phase_profile_v2():
+    """Forensics-first: log what the page actually contains, then escalate
+    share_url -> ?__a=1 -> web_profile_info -> headless Chrome render."""
+    username = ""
+    m_u = re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", PROFILE_URL)
+    if m_u:
+        username = m_u.group(1)
+    codes = []
+
+    def add(code, typ="p"):
+        if not code or code in ("en_US", "us", "web", "login", "accounts"):
+            return
+        if not any(c["code"] == code for c in codes):
+            codes.append({"code": code, "type": typ})
+
+    def harvest_html(html, tag):
+        n0 = len(codes)
+        for m in re.finditer(r'href="[^"]*/(p|reel|tv)/([A-Za-z0-9_-]{5,40})/', html or ""):
+            add(m.group(2), "reel" if m.group(1) in ("reel", "tv") else "p")
+        for m in re.finditer(r'"shortcode"\s*:\s*"([A-Za-z0-9_-]{5,40})"', html or ""):
+            add(m.group(1), "p")
+        log("PHASE1", "%s +%d -> total=%d" % (tag, len(codes) - n0, len(codes)))
+
+    def sweep_json(blob, tag):
+        n0 = len(codes)
+        for m in re.finditer(r'"shortcode"\s*:\s*"([A-Za-z0-9_-]{5,40})"', blob or ""):
+            add(m.group(1), "p")
+        if len(codes) != n0:
+            log("PHASE1", "%s json +%d -> total=%d" % (tag, len(codes) - n0, len(codes)))
+
+    # ---- S1: share URL + forensics dump
+    r = http_get(PROFILE_URL)
+    page = r.text if r else ""
+    log("PHASE1", "share_url len=%d shortcode_keys=%d p_href=%d login_wall=%s" % (
+        len(page), len(re.findall(r'"shortcode"', page)),
+        len(re.findall(r'href="[^"]*/(?:p|reel|tv)/', page)),
+        "/accounts/login" in page[:3000]))
+    if page:
+        harvest_html(page, "share_html")
+        blobs = re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', page, re.S)
+        log("PHASE1", "json_blobs=%d" % len(blobs))
+        for i, bl in enumerate(blobs[:12]):
+            try:
+                j = json.loads(bl)
+                keys = list(j.keys())[:8] if isinstance(j, dict) else ["<list:%d>" % len(j)]
+                log("PHASE1", "blob%d keys=%s len=%d" % (i, keys, len(bl)))
+            except Exception:
+                pass
+    claim = ""
+    try:
+        claim = S.response.headers.get("x-ig-set-www-claim", "") or ""
+    except Exception:
+        pass
+
+    # ---- S2: ?__a=1&__d=dis — accept ANY 2xx, log the body head
+    if len(codes) < 4 and username:
+        try:
+            r2 = S.get("https://www.instagram.com/%s/?__a=1&__d=dis" % username,
+                       timeout=30, headers={"User-Agent": UA, "Accept": "application/json"})
+            log("PHASE1", "a1 status=%d head=%r" % (r2.status_code, r2.text[:220]))
+            if r2.status_code < 300:
+                sweep_json(r2.text, "a1")
+        except Exception as e:
+            log("PHASE1", "a1 err %s" % str(e)[:100])
+
+    # ---- S3: web_profile_info with claim + browser headers
+    if len(codes) < 4 and username:
+        try:
+            r3 = S.get("https://www.instagram.com/api/v1/users/web_profile_info/?username=" + username,
+                       timeout=30, headers={"User-Agent": UA, "x-ig-app-id": IG_APP_ID,
+                                            "x-asbd-id": ASBD, "x-ig-www-claim": claim,
+                                            "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+                                            "Referer": PROFILE_URL})
+            log("PHASE1", "wpi status=%d head=%r" % (r3.status_code, r3.text[:220]))
+            if r3.status_code == 200:
+                sweep_json(r3.text, "wpi")
+        except Exception as e:
+            log("PHASE1", "wpi err %s" % str(e)[:100])
+
+    # ---- S4: headless Chrome render (runner has system Chrome) + scroll pagination
+    if len(codes) < 4:
+        try:
+            import subprocess as sp
+            sp.run([sys.executable, "-m", "pip", "install", "-q", "playwright"],
+                   check=True, timeout=240, capture_output=True)
+            from playwright.sync_api import sync_playwright
+            log("PHASE1", "playwright up — launching system chrome")
+            stkn = ""
+            pq = urllib.parse.parse_qs(urllib.parse.urlparse(PROFILE_URL).query)
+            if pq.get("stkn"):
+                stkn = "?stkn=" + pq["stkn"][0]
+            base = PROFILE_URL.split("?")[0].rstrip("/")
+            with sync_playwright() as pw:
+                br = pw.chromium.launch(channel="chrome", headless=True,
+                                        args=["--disable-blink-features=AutomationControlled",
+                                              "--no-sandbox"])
+                ctx = br.new_context(user_agent=UA, viewport={"width": 1366, "height": 900},
+                                     locale="en-US")
+                pg = ctx.new_page()
+
+                def render_walk(url, rounds, tag):
+                    pg.goto(url, wait_until="domcontentloaded", timeout=60000)
+                    pg.wait_for_timeout(3500)
+                    for sel in ['button:has-text("Not now")', 'button:has-text("Cancel")',
+                                'div[role="dialog"] button[aria-label="Close"]']:
+                        try:
+                            loc = pg.locator(sel).first
+                            if loc.is_visible(timeout=600):
+                                loc.click(timeout=1500)
+                                log("PHASE1", "%s dismissed: %s" % (tag, sel))
+                                break
+                        except Exception:
+                            pass
+                    streak, last = 0, -1
+                    for i in range(rounds):
+                        harvest_html(pg.content(), "%s_r%d" % (tag, i))
+                        if len(codes) == last:
+                            streak += 1
+                        else:
+                            streak, last = 0, len(codes)
+                        if streak >= 4 and i >= 3:
+                            break
+                        pg.mouse.wheel(0, 5000)
+                        pg.wait_for_timeout(1100)
+
+                render_walk(PROFILE_URL, 40, "chrome")
+                if len(codes) < 5:
+                    render_walk(base + "/reels/" + stkn, 20, "reels_tab")
+                br.close()
+            log("PHASE1", "chrome done codes=%d" % len(codes))
+        except Exception as e:
+            log("PHASE1", "chrome FAIL: %s" % str(e)[:300])
+
+    log("PHASE1", "TOTAL codes=%d" % len(codes))
+    return codes
+
 # ---------------- PHASE 2: per-post page ----------------
 def phase_posts(codes):
     posts = []
@@ -575,7 +711,7 @@ def write_outputs(posts):
 # ---------------- main ----------------
 def main():
     log("RUN", "profile=%s" % PROFILE_URL)
-    codes = phase_profile()
+    codes = phase_profile_v2()
     if not codes:
         log("FATAL", "no posts discovered — see strategies in log")
         sys.exit(2)
