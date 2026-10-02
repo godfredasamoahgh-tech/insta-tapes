@@ -510,7 +510,17 @@ def phase_profile_v3():
 
     docs = ["9310670392322965"]  # Scrapfly constant: account grid doc_id
     extra = re.findall(r'doc_id[\s:="]*(\d{12,20})', page)
-    for bu in re.findall(r'src="(https://[^"]+\.js)"', page)[:8]:
+    js_urls = []
+    for u in re.findall(r'src="([^"]+\.js)"', page):
+        if u.startswith("//"):
+            u = "https:" + u
+        elif u.startswith("/"):
+            u = "https://www.instagram.com" + u
+        if u.startswith("http"):
+            js_urls.append(u)
+    js_urls = list(dict.fromkeys(js_urls))
+    log("PHASE1", "bundle js refs=%d" % len(js_urls))
+    for bu in js_urls[:12]:
         try:
             rb = S.get(bu, timeout=30)
             if rb.status_code == 200:
@@ -569,8 +579,7 @@ def phase_profile_v3():
                     return None
                 conn = find_conn(j)
                 if not conn or not conn.get("edges"):
-                    log("PHASE1", "grid empty doc=%s keys=%s" % (
-                        did, list(j.get("data", {}).keys())[:4] if isinstance(j, dict) else "?"))
+                    log("PHASE1", "grid empty doc=%s body=%s" % (did, str(j)[:500]))
                     continue
                 n0 = len(codes)
                 for e in conn["edges"]:
