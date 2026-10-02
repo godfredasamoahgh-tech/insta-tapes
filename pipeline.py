@@ -1,0 +1,601 @@
+#!/usr/bin/env python3
+"""insta-tapes — Instagram profile -> video transcripts (Groq whisper) + full comments.
+Runs ONLY on GitHub Actions (clean Azure IP; our own egress is login-walled).
+Strategies logged per step; every fallback is explicit in the log.
+"""
+import os, re, sys, json, time, html, subprocess, urllib.parse
+
+PROFILE_URL = sys.argv[1] if len(sys.argv) > 1 else "https://www.instagram.com/androo.agi"
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+IG_APP_ID = "996165915644281"
+ASBD = "129477"
+GROQ_KEY = os.environ.get("GROQ_API_KEY", "")
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "out")
+os.makedirs(OUT, exist_ok=True)
+LOGF = open(os.path.join(OUT, "run.log"), "a", buffering=1)
+
+from curl_cffi import requests as cr
+S = cr.Session(impersonate="chrome")
+
+def log(kind, msg):
+    line = "%s|%s" % (kind, msg)
+    print(line, flush=True)
+    LOGF.write(line + "\n")
+
+# ---------------- json block extraction (probe v5 technique) ----------------
+def match_block(text, start, open_c, close_c):
+    depth, i, in_str, esc = 0, start, False, False
+    while i < len(text):
+        c = text[i]
+        if in_str:
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': in_str = False
+        else:
+            if c == '"': in_str = True
+            elif c == open_c: depth += 1
+            elif c == close_c:
+                depth -= 1
+                if depth == 0:
+                    return text[start:i + 1]
+        i += 1
+    return None
+
+def grab_json(page, anchor_re):
+    m = re.search(anchor_re, page)
+    if not m:
+        return None
+    i = page.find("{", m.end() - 1)
+    if i < 0:
+        i = page.find("[", m.end() - 1)
+    if i < 0:
+        return None
+    o = "{" if page[i] == "{" else "["
+    c = "}" if o == "{" else "]"
+    blk = match_block(page, i, o, c)
+    if not blk:
+        return None
+    try:
+        return json.loads(blk)
+    except Exception:
+        return None
+
+def http_get(url, tries=4, **kw):
+    kw.setdefault("timeout", 40)
+    kw.setdefault("headers", {})["User-Agent"] = UA
+    for a in range(tries):
+        try:
+            r = S.get(url, **kw)
+            if r.status_code == 200:
+                return r
+            last = "HTTP%d" % r.status_code
+        except Exception as e:
+            last = str(e)[:80]
+        time.sleep(2 + a * 3)
+    log("WARN", "get fail %s -> %s" % (url[:90], last))
+    return None
+
+# ---------------- PHASE 1: profile -> post list ----------------
+def phase_profile():
+    r = None
+    strategies = []
+    # S1: the URL as given (stkn share token may bypass the wall)
+    r = http_get(PROFILE_URL)
+    strategies.append(("share_url", r is not None))
+    page = r.text if r else ""
+    username = (re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", PROFILE_URL) or [None, ""])[1] \
+        if re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", PROFILE_URL) else ""
+    uid = None
+    codes = []   # list of dicts: {code, type}
+
+    def add(code, typ="p"):
+        if code and not any(c["code"] == code for c in codes):
+            codes.append({"code": code, "type": typ})
+
+    # parse embedded structures from page (whichever exists)
+    def parse_page(pg):
+        found_uid = None
+        # user id candidates
+        m = re.search(r'"(?:user_id|id|pk)"\s*:\s*"(\d{5,15})"', pg)
+        if m: found_uid = m.group(1)
+        # web_profile_info style
+        j = grab_json(pg, r'"xdt_api__v1__users__web_profile_info"')
+        if isinstance(j, dict):
+            user = (j.get("xdt_api__v1__users__web_profile_info") or {}).get("user") or {}
+            if user.get("id"): found_uid = user.get("id")
+            med = ((user.get("edge_owner_to_timeline_media") or {})
+                   or (user.get("media") or {}))
+            for n in (med.get("edges") or []):
+                node = n.get("node") or n
+                add(node.get("code"), "reel" if node.get("is_video") or node.get("__typename") == "GraphVideo" else "p")
+            for n in (med.get("nodes") or []):
+                add(n.get("code"), "reel" if n.get("is_video") else "p")
+        # classic sharedData
+        j2 = grab_json(pg, r'window\._sharedData\s*=')
+        if isinstance(j2, dict):
+            try:
+                entry = j2["entry_data"]["ProfilePage"][0]["graphql"]["user"]
+                found_uid = found_uid or entry.get("id")
+                med = entry.get("edge_owner_to_timeline_media") or {}
+                for e in med.get("edges", []):
+                    node = e.get("node") or {}
+                    add(node.get("shortcode"), "reel" if node.get("is_video") else "p")
+            except Exception:
+                pass
+        # raw shortcode sweep (last resort, grid SSR)
+        for m in re.finditer(r'"(?:shortcode|code)"\s*:\s*"([A-Za-z0-9_-]{5,30})"', pg):
+            add(m.group(1), "p")
+        return found_uid
+
+    uid = parse_page(page)
+    log("PHASE1", "share_url len=%d uid=%s codes=%d" % (len(page), uid, len(codes)))
+
+    # S2: web_profile_info API (usually anon-OK with app-id header)
+    if len(codes) < 4 and username:
+        r2 = http_get("https://www.instagram.com/api/v1/users/web_profile_info/?username=" + username,
+                      headers={"User-Agent": UA, "x-ig-app-id": IG_APP_ID, "Accept": "*/*"})
+        if r2:
+            try:
+                user = (r2.json()["data"]["user"] or {})
+                uid = uid or user.get("id")
+                med = user.get("edge_owner_to_timeline_media") or user.get("media") or {}
+                for e in (med.get("edges") or []):
+                    node = e.get("node") or {}
+                    add(node.get("shortcode") or node.get("code"),
+                        "reel" if node.get("is_video") else "p")
+                for n in (med.get("nodes") or []):
+                    add(n.get("code") or n.get("shortcode"), "reel" if n.get("is_video") else "p")
+                log("PHASE1", "web_profile_info codes=%d" % len(codes))
+            except Exception as e:
+                log("PHASE1", "web_profile_info parse fail: %s" % str(e)[:100])
+        strategies.append(("web_profile_info", r2 is not None))
+
+    # S3: ?__a=1&__d=dis
+    if len(codes) < 4 and username:
+        r3 = http_get("https://www.instagram.com/%s/?__a=1&__d=dis" % username,
+                      headers={"User-Agent": UA, "Accept": "application/json"})
+        if r3:
+            try:
+                j = r3.json()
+                graphql = j.get("graphql") or (j.get("data") or {}).get("user") or {}
+                med = graphql.get("edge_owner_to_timeline_media") or graphql.get("media") or {}
+                for e in (med.get("edges") or []):
+                    node = e.get("node") or {}
+                    add(node.get("shortcode") or node.get("code"), "reel" if node.get("is_video") else "p")
+                for n in (med.get("nodes") or []):
+                    add(n.get("code") or n.get("shortcode"), "reel" if n.get("is_video") else "p")
+                log("PHASE1", "a1d codes=%d" % len(codes))
+            except Exception as e:
+                log("PHASE1", "a1d parse fail: %s" % str(e)[:100])
+
+    # S4: GraphQL pagination for the FULL grid
+    if uid:
+        codes_count_before = len(codes)
+        claim = ""
+        try:
+            claim = S.response.headers.get("x-ig-set-www-claim", "") or ""
+        except Exception:
+            claim = ""
+        # doc_id discovery from page source
+        doc_ids = re.findall(r'"(?:doc_id|query_id)"\s*:\s*"(\d{5,20})"', page)
+        doc_ids = list(dict.fromkeys(doc_ids))
+        log("PHASE1", "doc_ids found=%d %s" % (len(doc_ids), doc_ids[:6]))
+        cursor = None
+        pages = 0
+        while pages < 20:
+            pages += 1
+            # pick a doc_id: try in order (first = profile grid typically)
+            got_page = False
+            for did in (doc_ids or [""]):
+                if not did:
+                    break
+                variables = {"id": str(uid), "first": 50}
+                if cursor:
+                    variables["after"] = cursor
+                body = "variables=" + urllib.parse.quote(json.dumps(variables)) + "&doc_id=" + did
+                try:
+                    rr = S.post("https://www.instagram.com/api/graphql", data=body, timeout=40, headers={
+                        "User-Agent": UA, "x-ig-app-id": IG_APP_ID, "x-asbd-id": ASBD,
+                        "x-ig-www-claim": claim, "content-type": "application/x-www-form-urlencoded",
+                        "Origin": "https://www.instagram.com", "Referer": PROFILE_URL,
+                    })
+                except Exception as e:
+                    log("PHASE1", "gql err %s" % str(e)[:80])
+                    continue
+                if rr.status_code != 200:
+                    log("PHASE1", "gql HTTP%d doc=%s" % (rr.status_code, did))
+                    continue
+                try:
+                    j = rr.json()
+                except Exception:
+                    log("PHASE1", "gql non-json doc=%s" % did)
+                    continue
+                if "login" in json.dumps(j)[:400].lower() and not re.search(r'"code"', json.dumps(j)[:2000]):
+                    log("PHASE1", "gql login-required doc=%s" % did)
+                    continue
+                data = j.get("data") or {}
+                media = None
+                for k, v in (data.items() if isinstance(data, dict) else []):
+                    if isinstance(v, dict):
+                        m2 = v.get("edge_owner_to_timeline_media") or v.get("media") or v.get("xdt_api__v1__media__shortcode__web_info")
+                        if isinstance(m2, dict) and (m2.get("edges") or m2.get("nodes")):
+                            media = m2
+                            break
+                if not media:
+                    continue
+                before = len(codes)
+                for e in (media.get("edges") or []):
+                    node = e.get("node") or {}
+                    add(node.get("shortcode") or node.get("code"), "reel" if node.get("is_video") else "p")
+                for n in (media.get("nodes") or []):
+                    add(n.get("code") or n.get("shortcode"), "reel" if n.get("is_video") else "p")
+                pg = media.get("page_info") or {}
+                cursor = pg.get("end_cursor")
+                got_page = True
+                log("PHASE1", "gql page=%d doc=%s +%d total=%d next=%s" %
+                    (pages, did, len(codes) - before, len(codes), bool(pg.get("has_next_page"))))
+                if not pg.get("has_next_page") or not cursor:
+                    cursor = None
+                    break
+                break
+            if not got_page or not cursor:
+                break
+        strategies.append(("graphql_pagination", len(codes) > codes_count_before))
+
+    log("PHASE1", "TOTAL codes=%d strategies=%s" % (len(codes), strategies))
+    return codes
+
+# ---------------- PHASE 2: per-post page ----------------
+def phase_posts(codes):
+    posts = []
+    n = len(codes)
+    for i, c in enumerate(codes, 1):
+        code, typ = c["code"], c.get("type") or "p"
+        url = "https://www.instagram.com/reel/%s/" % code if typ == "reel" else "https://www.instagram.com/p/%s/" % code
+        r = http_get(url, tries=3)
+        if not r:
+            # try the other path once
+            alt = "https://www.instagram.com/p/%s/" % code if typ == "reel" else "https://www.instagram.com/reel/%s/" % code
+            r = http_get(alt, tries=2)
+            if r:
+                url = alt
+        if not r:
+            log("POST", "%d/%d %s PAGE_FAIL" % (i, n, code))
+            posts.append({"code": code, "url": url, "error": "page_fail"})
+            continue
+        page = r.text
+        rec = {"code": code, "url": url}
+        # media: carousel_media literal array first (Law 25: authoritative array)
+        seq = []
+        m = re.search(r'"carousel_media"\s*:\s*\[', page)
+        if m:
+            blk = match_block(page, page.index("[", m.start()), "[", "]")
+            if blk:
+                try:
+                    seq = json.loads(blk)
+                except Exception:
+                    seq = []
+        if not seq:
+            # single media: video_versions / image_versions2 directly
+            single = grab_json(page, r'"video_versions"')
+            if isinstance(single, dict):
+                seq = [single.get("video_versions") and {"video_versions": single} or single]
+            if not seq:
+                info = grab_json(page, r'"xdt_api__v1__media__shortcode__web_info"')
+                if isinstance(info, dict):
+                    med = (info.get("xdt_api__v1__media__shortcode__web_info") or {}).get("media") or {}
+                    if med.get("carousel_media"):
+                        seq = med["carousel_media"]
+                    elif med:
+                        seq = [med]
+        videos = []
+        images = 0
+        for it in seq:
+            if not isinstance(it, dict):
+                continue
+            vv = it.get("video_versions") or (it.get("video_url") and {"candidates": [{"url": it.get("video_url")}]} or None)
+            if vv and (vv.get("candidates") or vv.get("url")):
+                cands = vv.get("candidates") or [vv]
+                u = cands[0].get("url")
+                if u:
+                    videos.append(u)
+            elif it.get("image_versions2"):
+                images += 1
+        rec["videos"] = videos
+        rec["images"] = images
+        # caption
+        cap = grab_json(page, r'"caption"\s*:\s*\{')
+        if isinstance(cap, dict):
+            rec["caption"] = (cap.get("text") or "")[:4000]
+        # meta timestamp/likes/comments
+        for key, anchor in (("taken_at", r'"taken_at"\s*:\s*'), ("like_count", r'"like_count"\s*:\s*'),
+                            ("comment_count", r'"comment_count"\s*:\s*')):
+            m2 = re.search(anchor + r'(\d+)', page)
+            if m2:
+                rec[key] = int(m2.group(1))
+        # comments: parent + threaded replies (embedded)
+        coms, total_got = parse_comments(page)
+        rec["comments"] = coms
+        rec["comment_count_found"] = total_got
+        log("POST", "%d/%d %s videos=%d comments=%d/%s" %
+            (i, n, code, len(videos), total_got, rec.get("comment_count", "?")))
+        posts.append(rec)
+        time.sleep(0.8)
+    return posts
+
+def parse_comments(page):
+    out = []
+    j = grab_json(page, r'"edge_media_to_parent_comment"\s*:\s*\{')
+    if isinstance(j, dict):
+        edges = (j.get("edges") or [])
+        for e in edges:
+            node = e.get("node") or {}
+            c = {
+                "user": (node.get("owner") or {}).get("username") or "?",
+                "text": (node.get("text") or ""),
+                "likes": node.get("like_count") or 0,
+                "id": node.get("id") or "",
+                "replies": [],
+            }
+            th = node.get("edge_threaded_comments") or {}
+            for re_ in (th.get("edges") or []):
+                rn = re_.get("node") or {}
+                c["replies"].append({
+                    "user": (rn.get("owner") or {}).get("username") or "?",
+                    "text": rn.get("text") or "",
+                    "likes": rn.get("like_count") or 0,
+                })
+            out.append(c)
+    return out, len(out)
+
+# ---------------- PHASE 3: full comments via GraphQL (best-effort) ----------
+def phase_comments_deep(posts, page_src):
+    doc_ids = list(dict.fromkeys(re.findall(r'"(?:doc_id|query_id)"\s*:\s*"(\d{5,20})"', page_src or "")))
+    if not doc_ids:
+        log("COMMENTS", "no doc_ids — embedded only")
+        return
+    claim = ""
+    try:
+        claim = S.response.headers.get("x-ig-set-www-claim", "") or ""
+    except Exception:
+        pass
+    deep_ok = 0
+    for rec in posts:
+        want = rec.get("comment_count") or 0
+        have = rec.get("comment_count_found") or 0
+        if not want or have >= want:
+            continue
+        media_id = None
+        # media pk: from embedded shortcode page — we stored only comments; refetch cheap? skip if absent
+        # GraphQL comments pagination needs media id + cursor; derive from stored comment ids (id = mediaid_commentid)
+        if rec.get("comments") and rec["comments"][0].get("id"):
+            media_id = str(rec["comments"][0]["id"]).split("_")[0]
+        if not media_id:
+            continue
+        cursor = None
+        for did in doc_ids:
+            fetched_extra = []
+            for _ in range(6):
+                variables = {"shortcode": rec["code"], "first": 50}
+                if cursor:
+                    variables["after"] = cursor
+                body = "variables=" + urllib.parse.quote(json.dumps(variables)) + "&doc_id=" + did
+                try:
+                    rr = S.post("https://www.instagram.com/api/graphql", data=body, timeout=40, headers={
+                        "User-Agent": UA, "x-ig-app-id": IG_APP_ID, "x-asbd-id": ASBD,
+                        "x-ig-www-claim": claim, "content-type": "application/x-www-form-urlencoded",
+                        "Origin": "https://www.instagram.com",
+                    })
+                    j = rr.json()
+                except Exception:
+                    break
+                edges = []
+                data = j.get("data") or {}
+                stack = [data]
+                while stack and not edges:
+                    cur = stack.pop()
+                    if isinstance(cur, dict):
+                        if "edges" in cur and isinstance(cur.get("edges"), list) and cur["edges"] and isinstance(cur["edges"][0], dict) and "node" in cur["edges"][0]:
+                            edges = cur["edges"]
+                        else:
+                            stack.extend(cur.values())
+                    elif isinstance(cur, list):
+                        stack.extend(cur)
+                if not edges:
+                    break
+                for e in edges:
+                    node = e.get("node") or {}
+                    fetched_extra.append({
+                        "user": (node.get("owner") or {}).get("username") or "?",
+                        "text": node.get("text") or "",
+                        "likes": node.get("like_count") or 0,
+                        "id": node.get("id") or "",
+                        "replies": [],
+                    })
+                # cursor
+                cursor = None
+                stack = [j.get("data") or {}]
+                while stack and not cursor:
+                    cur = stack.pop()
+                    if isinstance(cur, dict):
+                        pi = cur.get("page_info") or cur.get("paging_info")
+                        if isinstance(pi, dict) and pi.get("has_next_page") and pi.get("end_cursor"):
+                            cursor = pi["end_cursor"]
+                        else:
+                            stack.extend(cur.values())
+                    elif isinstance(cur, list):
+                        stack.extend(cur)
+                if not cursor:
+                    break
+                time.sleep(0.6)
+            if fetched_extra:
+                have_ids = {c.get("id") for c in rec["comments"]}
+                add_n = 0
+                for c in fetched_extra:
+                    if c["id"] not in have_ids:
+                        rec["comments"].append(c)
+                        have_ids.add(c["id"])
+                        add_n += 1
+                if add_n:
+                    rec["comment_count_found"] = len(rec["comments"])
+                    deep_ok += 1
+                    log("COMMENTS", "%s +%d -> %d/%s" % (rec["code"], add_n, len(rec["comments"]), want))
+                break
+        time.sleep(0.5)
+    log("COMMENTS", "deep-paginated posts=%d" % deep_ok)
+
+# ---------------- PHASE 4: video -> whisper ----------------
+def transcribe(videos, tag):
+    texts = []
+    for vi, vurl in enumerate(videos, 1):
+        ok = False
+        for attempt in range(3):
+            try:
+                r = S.get(vurl, timeout=120, headers={"User-Agent": UA, "Referer": "https://www.instagram.com/"})
+                if r.status_code != 200 or len(r.content) < 1024:
+                    raise RuntimeError("video HTTP%d len=%d" % (r.status_code, len(r.content)))
+                mp4 = "/tmp/v_%s_%d.mp4" % (tag, vi)
+                wav = "/tmp/a_%s_%d.wav" % (tag, vi)
+                open(mp4, "wb").write(r.content)
+                # 16k mono wav; if huge, cap length is fine — groq caps 25MB (16k wav ~ 47h/25MB, no issue)
+                subprocess.run(["ffmpeg", "-y", "-i", mp4, "-vn", "-ac", "1", "-ar", "16000",
+                                "-f", "wav", wav], check=True, capture_output=True, timeout=300)
+                if os.path.getsize(wav) > 24 * 1024 * 1024:
+                    subprocess.run(["ffmpeg", "-y", "-i", wav, "-b:a", "48k",
+                                    "/tmp/a_small.wav"], check=True, capture_output=True)
+                    os.replace("/tmp/a_small.wav", wav)
+                # whisper-large-v3 FIRST (Mo rule), turbo fallback
+                text = groq_whisper(wav)
+                texts.append(text)
+                os.remove(mp4); os.remove(wav)
+                ok = True
+                log("WHISPER", "%s v%d chars=%d" % (tag, vi, len(text)))
+                break
+            except Exception as e:
+                log("WARN", "%s v%d attempt%d: %s" % (tag, vi, attempt + 1, str(e)[:120]))
+                time.sleep(4 + attempt * 4)
+        if not ok:
+            texts.append("")
+            log("WHISPER", "%s v%d FAILED" % (tag, vi))
+    return "\n\n".join(t for t in texts if t).strip()
+
+_groq_model_tried = []
+def groq_whisper(wav):
+    import requests as rq
+    order = ["whisper-large-v3", "whisper-large-v3-turbo"]
+    last = ""
+    for model in order:
+        if model in _groq_model_tried and model != order[0]:
+            pass
+        for attempt in range(3):
+            try:
+                with open(wav, "rb") as fh:
+                    resp = rq.post(
+                        "https://api.groq.com/openai/v1/audio/transcriptions",
+                        headers={"Authorization": "Bearer " + GROQ_KEY, "User-Agent": UA},
+                        files={"file": (os.path.basename(wav), fh, "audio/wav")},
+                        data={"model": model, "response_format": "json", "language": ""},
+                        timeout=300,
+                    )
+                if resp.status_code == 200:
+                    if model != order[0]:
+                        log("WHISPER", "fallback model in use: %s" % model)
+                    return resp.json().get("text", "")
+                last = "HTTP%d %s" % (resp.status_code, resp.text[:150])
+                if resp.status_code in (400, 404) and "model" in resp.text.lower():
+                    break  # try next model
+                if resp.status_code == 429:
+                    time.sleep(8 + attempt * 8)
+                    continue
+                break
+            except Exception as e:
+                last = str(e)[:150]
+                time.sleep(5)
+        _groq_model_tried.append(model)
+    log("WARN", "groq fail: %s" % last)
+    raise RuntimeError("groq: " + last)
+
+# ---------------- PHASE 5: outputs ----------------
+def write_outputs(posts):
+    tapes = open(os.path.join(OUT, "ANDROO_TAPES.txt"), "w", encoding="utf-8")
+    chatter = open(os.path.join(OUT, "ANDROO_CHATTER.txt"), "w", encoding="utf-8")
+    n_vid = n_txt = n_fail = n_posts = 0
+    for i, rec in enumerate(posts, 1):
+        if rec.get("error"):
+            continue
+        n_posts += 1
+        head = "#%d %s" % (i, rec["url"])
+        tapes.write("=" * 70 + "\n" + head + "\n")
+        if rec.get("taken_at"):
+            try:
+                tapes.write("date: " + time.strftime("%Y-%m-%d %H:%M", time.gmtime(rec["taken_at"])) + " UTC\n")
+            except Exception:
+                pass
+        if rec.get("caption"):
+            tapes.write("caption: " + rec["caption"].replace("\n", " ")[:600] + "\n")
+        if rec.get("videos"):
+            tr = rec.get("transcript") or ""
+            if tr:
+                tapes.write("TRANSCRIPT:\n" + tr + "\n")
+                n_txt += 1
+            else:
+                tapes.write("TRANSCRIPT: [failed]\n")
+                n_fail += 1
+        else:
+            tapes.write("TRANSCRIPT: [no video — image/text post]\n")
+        tapes.write("\n")
+        chatter.write("=" * 70 + "\n" + head + "\n")
+        chatter.write("comments: %d shown / %s total\n" % (rec.get("comment_count_found") or 0, rec.get("comment_count", "?")))
+        for c in rec.get("comments") or []:
+            chatter.write("- %s (%d likes): %s\n" % (c["user"], c["likes"], c["text"].replace("\n", " ")))
+            for rp in c.get("replies") or []:
+                chatter.write("    -> %s: %s\n" % (rp["user"], (rp["text"] or "").replace("\n", " ")))
+        chatter.write("\n")
+        if rec.get("videos"):
+            n_vid += 1
+    tapes.close(); chatter.close()
+    vids = sum(len(r.get("videos") or []) for r in posts if not r.get("error"))
+    comments = sum(r.get("comment_count_found") or 0 for r in posts if not r.get("error"))
+    total_declared = sum(r.get("comment_count") or 0 for r in posts if not r.get("error"))
+    manifest = {
+        "profile": PROFILE_URL,
+        "posts_discovered": len(posts),
+        "posts_processed": n_posts,
+        "posts_with_video": n_vid,
+        "videos_transcribed_ok": n_txt,
+        "transcripts_failed": n_fail,
+        "comments_collected": comments,
+        "comments_declared_total": total_declared,
+    }
+    json.dump(manifest, open(os.path.join(OUT, "manifest.json"), "w"), indent=2)
+    log("DONE", json.dumps(manifest))
+    return manifest
+
+# ---------------- main ----------------
+def main():
+    log("RUN", "profile=%s" % PROFILE_URL)
+    codes = phase_profile()
+    if not codes:
+        log("FATAL", "no posts discovered — see strategies in log")
+        sys.exit(2)
+    # save grid early (resilience)
+    json.dump(codes, open(os.path.join(OUT, "grid.json"), "w"), indent=1)
+    posts = phase_posts(codes)
+    json.dump(posts, open(os.path.join(OUT, "posts_raw.json"), "w"), ensure_ascii=False)
+    # deep comments best-effort (uses last page html — refetch profile for doc_ids)
+    try:
+        r = http_get(PROFILE_URL, tries=2)
+        phase_comments_deep(posts, r.text if r else "")
+    except Exception as e:
+        log("WARN", "deep comments skipped: %s" % str(e)[:120])
+    # transcripts
+    for i, rec in enumerate(posts, 1):
+        if rec.get("videos") and not rec.get("error"):
+            rec["transcript"] = transcribe(rec["videos"], rec["code"])
+            json.dump(posts, open(os.path.join(OUT, "posts_raw.json"), "w"), ensure_ascii=False)
+    write_outputs(posts)
+    log("RUN", "ALL DONE")
+
+if __name__ == "__main__":
+    main()
