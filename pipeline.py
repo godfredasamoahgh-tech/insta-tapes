@@ -542,8 +542,8 @@ def phase_profile_v3():
                          "include_relationship_info": True,
                          "latest_besties_reel_media": True, "latest_reel_media": True},
                 "first": count, "last": None, "username": username,
-                "__relay_internal_pv__PolarisIsLoggedInrelayprovider": True,
-                "__relay_internal_pv__PolarisShareSheetV3relayprovider": True}
+                "__relay_internal__pv__PolarisIsLoggedInrelayprovider": False,
+                "__relay_internal__pv__PolarisShareSheetV3relayprovider": False}
 
     counts = [50, 12]
     picked = None
@@ -826,11 +826,13 @@ def phase_profile_v4():
                          "include_relationship_info": True,
                          "latest_besties_reel_media": True, "latest_reel_media": True},
                 "first": count, "last": None, "username": username,
-                "__relay_internal_pv__PolarisIsLoggedInrelayprovider": True,
-                "__relay_internal_pv__PolarisShareSheetV3relayprovider": True}
+                "__relay_internal__pv__PolarisIsLoggedInrelayprovider": False,
+                "__relay_internal__pv__PolarisShareSheetV3relayprovider": False}
     base_h = {"content-type": "application/x-www-form-urlencoded",
               "Accept-Language": "en-US,en;q=0.9", "Referer": PROFILE_URL}
     variants = [] if codes else [
+        ("POST12", dict(**base_h, **{"x-ig-app-id": IG_APP_ID}), full_vars(12), "POST"),
+        ("POST-app2", dict(**base_h, **{"x-ig-app-id": "936619743392459"}), full_vars(12), "POST"),
         ("g12-noid", dict(**base_h), full_vars(12)),
         ("g12-app1", dict(**base_h, **{"x-ig-app-id": IG_APP_ID}), full_vars(12)),
         ("g12-app2", dict(**base_h, **{"x-ig-app-id": "936619743392459"}), full_vars(12)),
@@ -854,11 +856,23 @@ def phase_profile_v4():
     picked = None
     chosen_vars = None
     for doc in docs:
-        for vname, hdrs, vv in variants:
-            params = {"doc_id": doc, "variables": json.dumps(vv, separators=(",", ":"))}
-            url = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(params)
-            r = http_get(url, ua=False, tries=1, headers=hdrs)
-            if not r:
+        for vname, hdrs, vv, *meth in variants:
+            method = meth[0] if meth else "GET"
+            if method == "POST":
+                url = "https://www.instagram.com/graphql/query"
+                body = ("variables=" +
+                        urllib.parse.quote(json.dumps(vv, separators=(",", ":"))) +
+                        "&doc_id=" + doc)
+                try:
+                    r = S.post(url, data=body, headers=hdrs, timeout=30)
+                except Exception as e:
+                    print("PHASE1|MX %s POST ERR %s" % (vname, str(e)[:80]), flush=True)
+                    r = None
+            else:
+                params = {"doc_id": doc, "variables": json.dumps(vv, separators=(",", ":"))}
+                url = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(params)
+                r = http_get(url, ua=False, tries=1, headers=hdrs)
+            if r is None:
                 print("PHASE1|MX %s doc=%s -> NOCONN" % (vname, doc), flush=True); continue
             try:
                 j = r.json()
