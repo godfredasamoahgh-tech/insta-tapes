@@ -61,9 +61,11 @@ def grab_json(page, anchor_re):
     except Exception:
         return None
 
-def http_get(url, tries=4, **kw):
+def http_get(url, tries=4, ua=True, **kw):
     kw.setdefault("timeout", 40)
-    kw.setdefault("headers", {})["User-Agent"] = UA
+    hdrs = kw.setdefault("headers", {})
+    if ua:
+        hdrs["User-Agent"] = UA
     for a in range(tries):
         try:
             r = S.get(url, **kw)
@@ -294,6 +296,19 @@ def phase_profile_v2():
                 log("PHASE1", "blob%d keys=%s len=%d" % (i, keys, len(bl)))
             except Exception:
                 pass
+    # S1b: retry share URL with ONE coherent fingerprint (no custom UA header)
+    if len(codes) < 4:
+        try:
+            r0b = http_get(PROFILE_URL, ua=False, tries=2)
+            page_b = r0b.text if r0b else ""
+            wall_b = "/accounts/login" in page_b[:3000]
+            n_sc = len(re.findall(r'"shortcode"', page_b))
+            log("PHASE1", "share_noua len=%d wall=%s shortcodes=%d" % (len(page_b), wall_b, n_sc))
+            if page_b and not wall_b:
+                page = page_b
+                harvest_html(page_b, "share_noua")
+        except Exception as e:
+            log("PHASE1", "share_noua err %s" % str(e)[:100])
     claim = ""
     try:
         claim = S.response.headers.get("x-ig-set-www-claim", "") or ""
@@ -325,6 +340,82 @@ def phase_profile_v2():
         except Exception as e:
             log("PHASE1", "wpi err %s" % str(e)[:100])
 
+    # ---- S3b: web_profile_info without custom UA + GraphQL grid pagination
+    if len(codes) < 6 and username:
+        wpi_text = ""
+        try:
+            r4 = S.get("https://www.instagram.com/api/v1/users/web_profile_info/?username=" + username,
+                       timeout=30, headers={"x-ig-app-id": IG_APP_ID, "x-asbd-id": ASBD,
+                                            "Accept": "*/*", "Referer": PROFILE_URL})
+            log("PHASE1", "wpi2 status=%d head=%r" % (r4.status_code, r4.text[:200]))
+            if r4.status_code == 200:
+                wpi_text = r4.text
+                sweep_json(wpi_text, "wpi2")
+        except Exception as e:
+            log("PHASE1", "wpi2 err %s" % str(e)[:100])
+        m_uid = re.search(r'"(?:user_id|id|pk)"\s*:\s*"(\d{5,15})"', wpi_text or "")
+        uid = m_uid.group(1) if m_uid else None
+        log("PHASE1", "uid=%s codes=%d" % (uid, len(codes)))
+        if uid and len(codes) < 6:
+            doc_ids = list(dict.fromkeys(re.findall(r'"(?:doc_id|query_id)"\s*:\s*"(\d{5,20})"', page or "")))
+            if not doc_ids:
+                bundles = list(dict.fromkeys(re.findall(r'src="(https://[^"]+\.js)"', page or "")))[:10]
+                log("PHASE1", "bundles=%d" % len(bundles))
+                for bu in bundles:
+                    try:
+                        rb = S.get(bu, timeout=30)
+                        if rb.status_code == 200:
+                            doc_ids.extend(re.findall(r'doc_id["\x27]?\s*[:=]\s*["\x27](\d{5,20})["\x27]', rb.text))
+                    except Exception:
+                        pass
+                    if len(doc_ids) > 30:
+                        break
+                doc_ids = list(dict.fromkeys(doc_ids))
+            log("PHASE1", "doc_ids=%d %s" % (len(doc_ids), doc_ids[:8]))
+            cursor = None
+            ok_doc = None
+            for rnd in range(24):
+                hit = False
+                for did in (doc_ids if ok_doc is None else [ok_doc]):
+                    if not did:
+                        break
+                    variables = {"id": str(uid), "first": 50}
+                    if cursor:
+                        variables["after"] = cursor
+                    body_ = "variables=" + urllib.parse.quote(json.dumps(variables)) + "&doc_id=" + did
+                    try:
+                        rq_ = S.post("https://www.instagram.com/api/graphql", data=body_, timeout=40,
+                                     headers={"x-ig-app-id": IG_APP_ID, "x-asbd-id": ASBD,
+                                              "x-ig-www-claim": claim,
+                                              "content-type": "application/x-www-form-urlencoded",
+                                              "Origin": "https://www.instagram.com", "Referer": PROFILE_URL})
+                    except Exception as e:
+                        log("PHASE1", "gql err %s" % str(e)[:80])
+                        continue
+                    if rq_.status_code != 200:
+                        log("PHASE1", "gql HTTP%d doc=%s" % (rq_.status_code, did))
+                        continue
+                    txt = rq_.text
+                    if '"login"' in txt[:800]:
+                        log("PHASE1", "gql login-wall doc=%s head=%r" % (did, txt[:150]))
+                        continue
+                    n0 = len(codes)
+                    sweep_json(txt, "gql")
+                    if len(codes) == n0:
+                        continue
+                    ok_doc = did
+                    cm = re.search(r'"end_cursor"\s*:\s*"([^"]+)"', txt)
+                    hm = re.search(r'"has_next_page"\s*:\s*(true|false)', txt)
+                    cursor = cm.group(1) if (cm and hm and hm.group(1) == "true") else None
+                    log("PHASE1", "gql r%d doc=%s +%d total=%d next=%s" %
+                        (rnd, did, len(codes) - n0, len(codes), bool(cursor)))
+                    hit = True
+                    break
+                if not hit or not cursor:
+                    break
+                time.sleep(0.5)
+        log("PHASE1", "after graphql codes=%d" % len(codes))
+
     # ---- S4: headless Chrome render (runner has system Chrome) + scroll pagination
     if len(codes) < 4:
         try:
@@ -349,6 +440,10 @@ def phase_profile_v2():
                 def render_walk(url, rounds, tag):
                     pg.goto(url, wait_until="domcontentloaded", timeout=60000)
                     pg.wait_for_timeout(3500)
+                    try:
+                        log("PHASE1", "%s landed url=%s title=%r" % (tag, (pg.url or "")[:110], (pg.title() or "")[:60]))
+                    except Exception:
+                        pass
                     for sel in ['button:has-text("Not now")', 'button:has-text("Cancel")',
                                 'div[role="dialog"] button[aria-label="Close"]']:
                         try:
