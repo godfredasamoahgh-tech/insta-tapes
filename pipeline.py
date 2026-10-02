@@ -1312,6 +1312,10 @@ def phase_comments_deep(posts, page_src):
         if not want or have >= want:
             continue
         media_id = rec.get("media_id")
+        if media_id:
+            media_id = str(media_id)
+            if media_id.startswith("POLARIS_"):
+                media_id = media_id[len("POLARIS_"):]
         if not media_id and rec.get("comments") and rec["comments"][0].get("id"):
             cand = str(rec["comments"][0]["id"]).split("_")[0]
             if cand.isdigit() and len(cand) > 10:
@@ -1322,20 +1326,18 @@ def phase_comments_deep(posts, page_src):
         cursor = None
         for _ in range(40):
             variables = {"media_id": str(media_id), "first": 50, "last": None,
-                         "before": None, "sort_order": "popular",
+                         "before": None, "sort_order": "popular", "after": cursor,
                          "__relay_internal__pv__PolarisIsLoggedInrelayprovider": False}
-            if cursor:
-                variables["after"] = cursor
             body = urllib.parse.urlencode({
                 "lsd": lsd,
                 "fb_api_req_friendly_name": "PolarisPostCommentsPaginationQuery",
                 "variables": json.dumps(variables, separators=(",", ":")),
                 "doc_id": doc_id,
-                "server_timestamps": "true",
             })
             try:
                 rr = S.post("https://www.instagram.com/api/graphql", data=body, timeout=40, headers={
-                    "User-Agent": UA, "x-ig-app-id": WEB_APP_ID, "x-asbd-id": ASBD,
+                    "User-Agent": UA, "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+                    "x-ig-app-id": WEB_APP_ID,
                     "content-type": "application/x-www-form-urlencoded",
                     "X-FB-LSD": lsd, "X-CSRFToken": csrf,
                     "Origin": "https://www.instagram.com",
