@@ -1,0 +1,38 @@
+RUN|profile=https://www.instagram.com/androo.agi?stkn=enZ2dnVqNW8yOHNt
+POST|Dd7XBExRZQy video url from grid node
+POST|1/15 Dd7XBExRZQy videos=3 comments=14/1865
+POST|Dd2fMAKR6O8 video url from grid node
+POST|2/15 Dd2fMAKR6O8 videos=3 comments=15/333
+POST|DdzzZJTxH7r video url from grid node
+POST|3/15 DdzzZJTxH7r videos=3 comments=15/23
+POST|DdxWFvax7u2 video url from grid node
+POST|4/15 DdxWFvax7u2 videos=3 comments=15/76
+POST|DduQUPyBSIx video url from grid node
+POST|5/15 DduQUPyBSIx videos=3 comments=13/45
+POST|DdsdFNwRSeC video url from grid node
+POST|6/15 DdsdFNwRSeC videos=3 comments=15/99
+POST|DdrVq4MR5Cz video url from grid node
+POST|7/15 DdrVq4MR5Cz videos=3 comments=14/24
+POST|Ddp6f-VxiLm video url from grid node
+POST|8/15 Ddp6f-VxiLm videos=3 comments=4/8
+POST|DYDdzwsRXIU video url from grid node
+POST|9/15 DYDdzwsRXIU videos=3 comments=15/27
+POST|10/15 DdvDpgnTEt3 videos=0 comments=3/3
+POST|11/15 Ddt9JrXCLVq videos=0 comments=0/0
+POST|12/15 DWCCNE-jo12 videos=0 comments=4/11
+POST|13/15 DdSG5a2oTs4 videos=0 comments=14/345
+POST|14/15 DYOBxV2xGgJ videos=0 comments=11/32
+POST|15/15 DYpuXTckf0F videos=0 comments=0/0
+WARN|get fail https://www.instagram.com/androo.agi?stkn=enZ2dnVqNW8yOHNt -> HTTP429
+COMMENTS|no lsd token — deep comments skipped (embedded only)
+WHISPER|Dd7XBExRZQy v1 chars=2664
+WHISPER|Dd2fMAKR6O8 v1 chars=3011
+WHISPER|DdzzZJTxH7r v1 chars=2877
+WHISPER|DdxWFvax7u2 v1 chars=3014
+WHISPER|DduQUPyBSIx v1 chars=3091
+WHISPER|DdsdFNwRSeC v1 chars=2970
+WHISPER|DdrVq4MR5Cz v1 chars=2725
+WHISPER|Ddp6f-VxiLm v1 chars=2969
+WHISPER|DYDdzwsRXIU v1 chars=2900
+DONE|{"profile": "https://www.instagram.com/androo.agi?stkn=enZ2dnVqNW8yOHNt", "posts_discovered": 15, "posts_processed": 15, "posts_with_video": 9, "videos_transcribed_ok": 9, "transcripts_failed": 0, "comments_collected": 152, "comments_declared_total": 2891}
+RUN|ALL DONE

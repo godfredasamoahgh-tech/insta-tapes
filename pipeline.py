@@ -1289,7 +1289,16 @@ def phase_comments_deep(posts, page_src):
     if m_lsd:
         lsd = m_lsd.group(1)
     if not lsd:
-        log("COMMENTS", "no lsd token — deep comments skipped (embedded only)")
+        # wall page carries no LSD bootstrap — pull it from the homepage instead
+        try:
+            rh = S.get("https://www.instagram.com/", timeout=30)
+            m2 = re.search(r'\["LSD",\s*\[\],\s*\{"token":"([^"]+)"', rh.text)
+            if m2:
+                lsd = m2.group(1)
+        except Exception:
+            pass
+    if not lsd:
+        log("COMMENTS", "no lsd token anywhere — deep comments skipped (embedded only)")
         return
     csrf = ""
     try:
