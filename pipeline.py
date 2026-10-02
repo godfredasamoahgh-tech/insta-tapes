@@ -779,7 +779,8 @@ def phase_profile_v4():
                 GRID_INFO[c] = {"video_urls": vurls, "image_url": img,
                                 "captions": [capq] if capq else [],
                                 "likes": likes, "taken_at": nd.get("taken_at"),
-                                "comments_count": ccount}
+                                "comments_count": ccount,
+                                "media_id": str(nd.get("id") or nd.get("pk") or "") or None}
                 add(c, typ)
             pi2 = cq.get("page_info") or {}
             if not pi2.get("has_next_page"):
@@ -956,7 +957,8 @@ def phase_profile_v4():
                                             "captions": [capm] if capm else [],
                                             "likes": nd.get("like_count"),
                                             "taken_at": nd.get("taken_at"),
-                                            "comments_count": nd.get("comment_count")}
+                                            "comments_count": nd.get("comment_count"),
+                                            "media_id": str(nd.get("id") or nd.get("pk") or "") or None}
                             add(c, typ)
                         if jm.get("more_available") and jm.get("next_max_id") and items:
                             max_id = str(jm["next_max_id"])
@@ -1023,7 +1025,8 @@ def phase_profile_v4():
                             "captions": [cap] if cap else [],
                             "likes": nd.get("like_count"),
                             "taken_at": nd.get("taken_at"),
-                            "comments_count": nd.get("comment_count")}
+                            "comments_count": nd.get("comment_count"),
+                            "media_id": str(nd.get("id") or nd.get("pk") or "") or None}
             add(c, typ)
         pi = conn.get("page_info") or {}
         print("PHASE1|page r%d +%d total=%d next=%s" %
@@ -1068,6 +1071,7 @@ def phase_posts(codes):
                        "taken_at": gi.get("taken_at"), "like_count": gi.get("likes"),
                        "comment_count": gi.get("comments_count"),
                        "comments": [], "comment_count_found": 0,
+                       "media_id": gi.get("media_id"),
                        "source": "grid_node"}
                 log("POST", "%d/%d %s PAGE_FAIL->grid_node videos=%d" %
                     (i, n, code, len(rec["videos"])))
@@ -1176,6 +1180,8 @@ def phase_posts(codes):
                     coms.append(cnode)
                 rec["comments"] = coms
                 rec["comment_count_found"] = len(coms)
+        if modern_ok and isinstance(post, dict) and (post.get("id") or post.get("pk")):
+            rec["media_id"] = str(post.get("id") or post.get("pk"))
 
         if not modern_ok:
             # legacy pre-2026 shapes (Law 25: literal arrays first)
@@ -1274,13 +1280,20 @@ def parse_comments(page):
 
 # ---------------- PHASE 3: full comments via GraphQL (best-effort) ----------
 def phase_comments_deep(posts, page_src):
-    doc_ids = list(dict.fromkeys(re.findall(r'"(?:doc_id|query_id)"\s*:\s*"(\d{5,20})"', page_src or "")))
-    if not doc_ids:
-        log("COMMENTS", "no doc_ids — embedded only")
+    # production recipe (FxEmbed): PolarisPostCommentsPaginationQuery — media_id vars + lsd
+    doc_id = "25516980651312394"
+    lsd = ""
+    m_lsd = re.search(r'["\']LSD["\'],\s*\[\],\s*\{\s*["\']token["\']\s*:\s*["\']([^"\']+)', page_src or "")
+    if not m_lsd:
+        m_lsd = re.search(r'lsd["\']?\s*[:=]\s*["\']([A-Za-z0-9+/=]{8,})', page_src or "")
+    if m_lsd:
+        lsd = m_lsd.group(1)
+    if not lsd:
+        log("COMMENTS", "no lsd token — deep comments skipped (embedded only)")
         return
-    claim = ""
+    csrf = ""
     try:
-        claim = S.response.headers.get("x-ig-set-www-claim", "") or ""
+        csrf = S.cookies.get("csrftoken") or ""
     except Exception:
         pass
     deep_ok = 0
@@ -1289,87 +1302,114 @@ def phase_comments_deep(posts, page_src):
         have = rec.get("comment_count_found") or 0
         if not want or have >= want:
             continue
-        media_id = None
-        # media pk: from embedded shortcode page — we stored only comments; refetch cheap? skip if absent
-        # GraphQL comments pagination needs media id + cursor; derive from stored comment ids (id = mediaid_commentid)
-        if rec.get("comments") and rec["comments"][0].get("id"):
-            media_id = str(rec["comments"][0]["id"]).split("_")[0]
+        media_id = rec.get("media_id")
+        if not media_id and rec.get("comments") and rec["comments"][0].get("id"):
+            cand = str(rec["comments"][0]["id"]).split("_")[0]
+            if cand.isdigit() and len(cand) > 10:
+                media_id = cand
         if not media_id:
             continue
+        fetched_extra = []
         cursor = None
-        for did in doc_ids:
-            fetched_extra = []
-            for _ in range(6):
-                variables = {"shortcode": rec["code"], "first": 50}
-                if cursor:
-                    variables["after"] = cursor
-                body = "variables=" + urllib.parse.quote(json.dumps(variables)) + "&doc_id=" + did
-                try:
-                    rr = S.post("https://www.instagram.com/api/graphql", data=body, timeout=40, headers={
-                        "User-Agent": UA, "x-ig-app-id": IG_APP_ID, "x-asbd-id": ASBD,
-                        "x-ig-www-claim": claim, "content-type": "application/x-www-form-urlencoded",
-                        "Origin": "https://www.instagram.com",
-                    })
-                    j = rr.json()
-                except Exception:
-                    break
-                edges = []
-                data = j.get("data") or {}
-                stack = [data]
-                while stack and not edges:
-                    cur = stack.pop()
-                    if isinstance(cur, dict):
-                        if "edges" in cur and isinstance(cur.get("edges"), list) and cur["edges"] and isinstance(cur["edges"][0], dict) and "node" in cur["edges"][0]:
-                            edges = cur["edges"]
-                        else:
-                            stack.extend(cur.values())
-                    elif isinstance(cur, list):
-                        stack.extend(cur)
-                if not edges:
-                    break
-                for e in edges:
-                    node = e.get("node") or {}
-                    fetched_extra.append({
-                        "user": (node.get("owner") or {}).get("username") or "?",
-                        "text": node.get("text") or "",
-                        "likes": node.get("like_count") or 0,
-                        "id": node.get("id") or "",
-                        "replies": [],
-                    })
-                # cursor
-                cursor = None
-                stack = [j.get("data") or {}]
-                while stack and not cursor:
-                    cur = stack.pop()
-                    if isinstance(cur, dict):
-                        pi = cur.get("page_info") or cur.get("paging_info")
-                        if isinstance(pi, dict) and pi.get("has_next_page") and pi.get("end_cursor"):
-                            cursor = pi["end_cursor"]
-                        else:
-                            stack.extend(cur.values())
-                    elif isinstance(cur, list):
-                        stack.extend(cur)
-                if not cursor:
-                    break
-                time.sleep(0.6)
-            if fetched_extra:
-                have_ids = {c.get("id") for c in rec["comments"]}
-                add_n = 0
-                for c in fetched_extra:
-                    if c["id"] not in have_ids:
-                        rec["comments"].append(c)
-                        have_ids.add(c["id"])
-                        add_n += 1
-                if add_n:
-                    rec["comment_count_found"] = len(rec["comments"])
-                    deep_ok += 1
-                    log("COMMENTS", "%s +%d -> %d/%s" % (rec["code"], add_n, len(rec["comments"]), want))
+        for _ in range(40):
+            variables = {"media_id": str(media_id), "first": 50, "last": None,
+                         "before": None, "sort_order": "popular",
+                         "__relay_internal__pv__PolarisIsLoggedInrelayprovider": False}
+            if cursor:
+                variables["after"] = cursor
+            body = urllib.parse.urlencode({
+                "lsd": lsd,
+                "fb_api_req_friendly_name": "PolarisPostCommentsPaginationQuery",
+                "variables": json.dumps(variables, separators=(",", ":")),
+                "doc_id": doc_id,
+                "server_timestamps": "true",
+            })
+            try:
+                rr = S.post("https://www.instagram.com/api/graphql", data=body, timeout=40, headers={
+                    "User-Agent": UA, "x-ig-app-id": WEB_APP_ID, "x-asbd-id": ASBD,
+                    "content-type": "application/x-www-form-urlencoded",
+                    "X-FB-LSD": lsd, "X-CSRFToken": csrf,
+                    "Origin": "https://www.instagram.com",
+                    "Referer": rec.get("url") or "https://www.instagram.com/",
+                })
+                j = rr.json()
+            except Exception as e:
+                log("COMMENTS", "%s POST fail %s" % (rec["code"], str(e)[:80]))
                 break
+            edges = []
+            stack = [j.get("data") or {}]
+            while stack and not edges:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    if isinstance(cur.get("edges"), list) and cur["edges"] and isinstance(cur["edges"][0], dict) and "node" in cur["edges"][0]:
+                        edges = cur["edges"]
+                    else:
+                        stack.extend(cur.values())
+                elif isinstance(cur, list):
+                    stack.extend(cur)
+            if not edges:
+                if not fetched_extra:
+                    log("COMMENTS", "%s no edges head=%s" % (rec["code"], str(j)[:160]))
+                break
+            for e in edges:
+                node = e.get("node") or {}
+                rps = []
+                for key in ("threaded_comments", "edge_threaded_comments", "replies"):
+                    rep = node.get(key)
+                    if isinstance(rep, dict):
+                        for re_ in (rep.get("edges") or []):
+                            rn = re_.get("node") or {}
+                            ru = rn.get("user") or rn.get("owner") or {}
+                            rps.append({"user": ru.get("username") or "?",
+                                        "text": rn.get("text") or "",
+                                        "likes": rn.get("comment_like_count") or rn.get("like_count") or 0})
+                fetched_extra.append({
+                    "user": (node.get("user") or node.get("owner") or {}).get("username") or "?",
+                    "text": node.get("text") or "",
+                    "likes": node.get("comment_like_count") or node.get("like_count") or 0,
+                    "id": str(node.get("id") or node.get("pk") or ""),
+                    "replies": rps,
+                })
+            cursor = None
+            stack = [j.get("data") or {}]
+            while stack and not cursor:
+                cur = stack.pop()
+                if isinstance(cur, dict):
+                    pi = cur.get("page_info") or cur.get("paging_info")
+                    if isinstance(pi, dict) and pi.get("has_next_page") and pi.get("end_cursor"):
+                        cursor = pi["end_cursor"]
+                    else:
+                        stack.extend(cur.values())
+                elif isinstance(cur, list):
+                    stack.extend(cur)
+            if not cursor:
+                break
+            time.sleep(0.6)
+        if fetched_extra:
+            have_ids = {c.get("id") for c in rec["comments"]}
+            add_n = 0
+            for c in fetched_extra:
+                if c["id"] not in have_ids:
+                    rec["comments"].append(c)
+                    have_ids.add(c["id"])
+                    add_n += 1
+            if add_n:
+                rec["comment_count_found"] = len(rec["comments"])
+                deep_ok += 1
+                log("COMMENTS", "%s +%d -> %d/%s" % (rec["code"], add_n, len(rec["comments"]), want))
         time.sleep(0.5)
     log("COMMENTS", "deep-paginated posts=%d" % deep_ok)
 
 # ---------------- PHASE 4: video -> whisper ----------------
 def transcribe(videos, tag):
+    # dedupe quality-candidates of the SAME video (same CDN path, different sig) — 3 jobs -> 1
+    _seen, uniq = set(), []
+    for u in videos:
+        k = (u or "").split("?")[0]
+        if k and k not in _seen:
+            _seen.add(k)
+            uniq.append(u)
+    videos = uniq
     texts = []
     for vi, vurl in enumerate(videos, 1):
         ok = False
@@ -1418,7 +1458,8 @@ def groq_whisper(wav):
                         "https://api.groq.com/openai/v1/audio/transcriptions",
                         headers={"Authorization": "Bearer " + GROQ_KEY, "User-Agent": UA},
                         files={"file": (os.path.basename(wav), fh, "audio/wav")},
-                        data={"model": model, "response_format": "json", "language": ""},
+                        # auto-detect Persian/English: OMIT language (empty string = Groq 400 "unsupported language")
+                    data={"model": model, "response_format": "json"},
                         timeout=300,
                     )
                 if resp.status_code == 200:
