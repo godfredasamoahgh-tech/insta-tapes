@@ -477,6 +477,158 @@ def phase_profile_v2():
     log("PHASE1", "TOTAL codes=%d" % len(codes))
     return codes
 
+GRID_INFO = {}
+
+def phase_profile_v3():
+    """Grid-first (Scrapfly 2026 recipe): GET graphql/query with the account
+    doc_id + relay variables. Independent of the (often walled) profile HTML.
+    Falls back to v2 strategies when the grid endpoint refuses."""
+    global GRID_INFO
+    username = ""
+    m_u = re.search(r"instagram\.com/([A-Za-z0-9_.]+)/?", PROFILE_URL)
+    if m_u:
+        username = m_u.group(1)
+    if not username:
+        log("PHASE1", "no username parsed from URL"); return []
+
+    codes = []
+    def add(code, typ="p"):
+        if code and code not in ("en_US", "us", "web", "login") and \
+           not any(c["code"] == code for c in codes):
+            codes.append({"code": code, "type": typ})
+
+    # best-effort profile page: loose doc_ids + is_private (page may be walled)
+    page = ""
+    r0 = http_get(PROFILE_URL)
+    if r0: page = r0.text or ""
+    wall = ("/accounts/login" in (getattr(r0, "url", "") or "")) if r0 else True
+    log("PHASE1", "profile page len=%d wall=%s xig=%s" % (
+        len(page), wall, "xig_user_by_username" in page))
+    if "xig_user_by_username" in page:
+        m_priv = re.search(r'"is_private"\s*:\s*(true|false)', page)
+        log("PHASE1", "is_private=%s" % (m_priv.group(1) if m_priv else "?"))
+
+    docs = ["9310670392322965"]  # Scrapfly constant: account grid doc_id
+    extra = re.findall(r'doc_id[\s:="]*(\d{12,20})', page)
+    for bu in re.findall(r'src="(https://[^"]+\.js)"', page)[:8]:
+        try:
+            rb = S.get(bu, timeout=30)
+            if rb.status_code == 200:
+                extra += re.findall(r'doc_id[\s:="]*(\d{12,20})', rb.text)
+        except Exception:
+            pass
+    for d in dict.fromkeys(extra):
+        if d not in docs: docs.append(d)
+    log("PHASE1", "grid docs to try: %s" % docs[:6])
+
+    def grid_params(count):
+        return {"after": None, "before": None,
+                "data": {"count": count, "include_reel_media_seen_timestamp": True,
+                         "include_relationship_info": True,
+                         "latest_besties_reel_media": True, "latest_reel_media": True},
+                "first": count, "last": None, "username": username,
+                "__relay_internal_pv__PolarisIsLoggedInrelayprovider": True,
+                "__relay_internal_pv__PolarisShareSheetV3relayprovider": True}
+
+    counts = [50, 12]
+    picked = None
+    prev_cursor = None
+    for ci, cnt in enumerate(counts):
+        variables = grid_params(cnt)
+        for rnd in range(60):
+            hit = False
+            for did in ([picked] if picked else docs):
+                params = {"doc_id": did,
+                          "variables": json.dumps(variables, separators=(",", ":"))}
+                url = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(params)
+                r = http_get(url, ua=False, tries=2, headers={
+                    "content-type": "application/x-www-form-urlencoded",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "x-ig-app-id": IG_APP_ID,
+                    "Referer": PROFILE_URL})
+                if not r or r.status_code != 200:
+                    log("PHASE1", "grid HTTP %s doc=%s cnt=%d" % (
+                        (r.status_code if r else "?"), did, cnt)); continue
+                txt = r.text
+                if '"require_login"' in txt[:400] or '"login"' in txt[:400]:
+                    log("PHASE1", "grid gated doc=%s head=%r" % (did, txt[:150])); continue
+                try:
+                    j = json.loads(txt)
+                except Exception:
+                    log("PHASE1", "grid non-json doc=%s %r" % (did, txt[:120])); continue
+                def find_conn(o):
+                    if isinstance(o, dict):
+                        if "edges" in o and "page_info" in o: return o
+                        for v in o.values():
+                            got = find_conn(v)
+                            if got: return got
+                    elif isinstance(o, list):
+                        for v in o:
+                            got = find_conn(v)
+                            if got: return got
+                    return None
+                conn = find_conn(j)
+                if not conn or not conn.get("edges"):
+                    log("PHASE1", "grid empty doc=%s keys=%s" % (
+                        did, list(j.get("data", {}).keys())[:4] if isinstance(j, dict) else "?"))
+                    continue
+                n0 = len(codes)
+                for e in conn["edges"]:
+                    nd = e.get("node") or {}
+                    c = nd.get("code") or nd.get("shortcode") or ""
+                    if not c: continue
+                    vurls = []
+                    vv = nd.get("video_versions")
+                    if isinstance(vv, dict):
+                        vurls = [x.get("url") for x in (vv.get("candidates") or []) if x.get("url")]
+                    elif isinstance(vv, list):
+                        vurls = [x.get("url") for x in vv if isinstance(x, dict) and x.get("url")]
+                    cap = nd.get("caption")
+                    if isinstance(cap, dict): cap = cap.get("text") or ""
+                    im = nd.get("image_versions2") or {}
+                    iurl = ""
+                    if isinstance(im, dict):
+                        cands = im.get("candidates") or []
+                        if cands: iurl = cands[0].get("url") or ""
+                    typename = str(nd.get("__typename") or nd.get("media_type") or "")
+                    typ = "reel" if ("Reel" in typename or typename == "2") else "p"
+                    GRID_INFO[c] = {"video_urls": [u for u in vurls if u],
+                                    "image_url": iurl or nd.get("display_uri") or "",
+                                    "captions": [cap] if cap else [],
+                                    "likes": nd.get("like_count"),
+                                    "taken_at": nd.get("taken_at"),
+                                    "comments_count": nd.get("comment_count")}
+                    add(c, typ)
+                pi = conn.get("page_info") or {}
+                log("PHASE1", "grid r%d doc=%s cnt=%d +%d total=%d next=%s" % (
+                    rnd, did, cnt, len(codes) - n0, len(codes),
+                    bool(pi.get("has_next_page"))))
+                if len(codes) > n0: picked = did
+                hit = True
+                if not pi.get("has_next_page") or not pi.get("end_cursor"):
+                    prev_cursor = "__end__"; break
+                if pi.get("end_cursor") == prev_cursor:
+                    log("PHASE1", "cursor stall, stopping"); prev_cursor = "__end__"; break
+                prev_cursor = pi.get("end_cursor")
+                variables["after"] = pi.get("end_cursor")
+                break
+            if (not hit) or prev_cursor == "__end__":
+                break
+            time.sleep(0.4)
+        if prev_cursor == "__end__":
+            break
+
+    # Google-index seeds as safety net (public profile shortcodes)
+    for sc in ["Dd7XBExRZQy", "DdvDpgnTEt3", "Ddt9JrXCLVq", "DWCCNE-jo12",
+               "DdSG5a2oTs4", "DYOBxV2xGgJ", "DYpuXTckf0F"]:
+        add(sc, "p")
+    log("PHASE1", "TOTAL codes=%d (grid+seeds)" % len(codes))
+    if len(codes) <= 7:
+        log("PHASE1", "grid failed/empty — escalating to v2 strategies")
+        for c2 in phase_profile_v2():
+            add(c2.get("code"), c2.get("type") or "p")
+    return codes
+
 # ---------------- PHASE 2: per-post page ----------------
 def phase_posts(codes):
     posts = []
@@ -492,6 +644,21 @@ def phase_posts(codes):
             if r:
                 url = alt
         if not r:
+            gi = GRID_INFO.get(code)
+            if gi and (gi.get("video_urls") or gi.get("image_url")):
+                caps = gi.get("captions") or [""]
+                rec = {"code": code, "url": url,
+                       "videos": list(gi.get("video_urls") or []),
+                       "images": 1 if gi.get("image_url") else 0,
+                       "caption": (caps[0] or "")[:4000],
+                       "taken_at": gi.get("taken_at"), "like_count": gi.get("likes"),
+                       "comment_count": gi.get("comments_count"),
+                       "comments": [], "comment_count_found": 0,
+                       "source": "grid_node"}
+                log("POST", "%d/%d %s PAGE_FAIL->grid_node videos=%d" %
+                    (i, n, code, len(rec["videos"])))
+                posts.append(rec)
+                continue
             log("POST", "%d/%d %s PAGE_FAIL" % (i, n, code))
             posts.append({"code": code, "url": url, "error": "page_fail"})
             continue
@@ -533,12 +700,17 @@ def phase_posts(codes):
                     videos.append(u)
             elif it.get("image_versions2"):
                 images += 1
+        if not videos and GRID_INFO.get(code, {}).get("video_urls"):
+            videos = list(GRID_INFO[code]["video_urls"])
+            log("POST", "%s video url from grid node" % code)
         rec["videos"] = videos
         rec["images"] = images
         # caption
         cap = grab_json(page, r'"caption"\s*:\s*\{')
         if isinstance(cap, dict):
             rec["caption"] = (cap.get("text") or "")[:4000]
+        elif GRID_INFO.get(code, {}).get("captions"):
+            rec["caption"] = (GRID_INFO[code]["captions"][0] or "")[:4000]
         # meta timestamp/likes/comments
         for key, anchor in (("taken_at", r'"taken_at"\s*:\s*'), ("like_count", r'"like_count"\s*:\s*'),
                             ("comment_count", r'"comment_count"\s*:\s*')):
@@ -806,7 +978,7 @@ def write_outputs(posts):
 # ---------------- main ----------------
 def main():
     log("RUN", "profile=%s" % PROFILE_URL)
-    codes = phase_profile_v2()
+    codes = phase_profile_v3()
     if not codes:
         log("FATAL", "no posts discovered — see strategies in log")
         sys.exit(2)
