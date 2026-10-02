@@ -478,6 +478,11 @@ def phase_profile_v2():
     return codes
 
 GRID_INFO = {}
+WEB_APP_ID = "936619743392459"
+QH = "472f257a40c653c64c666ce877d59d2b"
+COMMENT_DOC = "25516980651312394"
+POST_ROOT_DOC = "27130156389949648"
+IG_ASBD = "359341"
 
 def phase_profile_v3():
     """Grid-first (Scrapfly 2026 recipe): GET graphql/query with the account
@@ -675,7 +680,118 @@ def phase_profile_v4():
                 discovered += list(dict.fromkeys(page_docs))
                 print("PHASE1|seed page doc_ids=%s" % page_docs[:8], flush=True)
             break
+    # A0) legacy query_hash timeline — FxEmbed/yt-dlp production recipe
+    uid = None
     if seed:
+        for pat in (r'"owner"\s*:\s*\{[^}]*"id"\s*:\s*"(\d+)"',
+                    r'"pk"\s*:\s*"(\d{6,15})"',
+                    r'"user_id"\s*:\s*"(\d{6,15})"',
+                    r'"id"\s*:\s*"(\d{15,20})"'):
+            mu = re.search(pat, seed)
+            if mu:
+                uid = mu.group(1)
+                break
+    print("PHASE1|qh uid=%s" % uid, flush=True)
+    if uid:
+        vh = {"Accept": "*/*", "Accept-Language": "en-US,en;q=0.9",
+              "Referer": "https://www.instagram.com/%s/" % username,
+              "Origin": "https://www.instagram.com",
+              "X-IG-App-ID": WEB_APP_ID}
+        try:
+            _csrf = S.cookies.get("csrftoken")
+        except Exception:
+            _csrf = None
+        if _csrf:
+            vh["X-CSRFToken"] = _csrf
+        def _qh_conn(o):
+            if isinstance(o, dict):
+                if "connection" in str(o.get("__typename", "")):
+                    return o
+                for v in o.values():
+                    g = _qh_conn(v)
+                    if g:
+                        return g
+            elif isinstance(o, list):
+                for v in o:
+                    g = _qh_conn(v)
+                    if g:
+                        return g
+            return None
+        cursor = None
+        for qr in range(60):
+            _vars = {"id": uid, "first": 12}
+            if cursor:
+                _vars["after"] = cursor
+            qurl = "https://www.instagram.com/graphql/query/?" + urllib.parse.urlencode(
+                {"query_hash": QH,
+                 "variables": json.dumps(_vars, separators=(",", ":"))})
+            try:
+                rq = S.get(qurl, timeout=30, headers=vh)
+                if rq.status_code != 200:
+                    print("PHASE1|QH HTTP %d head=%s" %
+                          (rq.status_code, rq.text[:140]), flush=True)
+                    break
+                dq = rq.json()
+            except Exception as e:
+                print("PHASE1|QH ERR %s" % str(e)[:100], flush=True)
+                break
+            if qr == 0:
+                print("PHASE1|QH head=%s" % str(dq)[:220], flush=True)
+            cq = _qh_conn(dq)
+            if not cq:
+                print("PHASE1|QH no-conn page%d" % qr, flush=True)
+                break
+            eds = cq.get("edges") or []
+            if qr == 0:
+                print("PHASE1|QH conn=%s edges0=%s" %
+                      (cq.get("__typename"),
+                       sorted(list((eds[0].get("node") or {}).keys()))[:14]
+                       if eds else []), flush=True)
+            if not eds:
+                break
+            for e in eds:
+                nd = e.get("node") or {}
+                c = nd.get("shortcode") or ""
+                if not c:
+                    continue
+                typ = "reel" if nd.get("product_type") == "clips" else "p"
+                vurls = []
+                vvs = nd.get("video_versions")
+                if isinstance(vvs, list):
+                    vurls = [x.get("url") for x in vvs
+                             if isinstance(x, dict) and x.get("url")]
+                elif isinstance(vvs, dict):
+                    vurls = [x.get("url") for x in (vvs.get("candidates") or [])
+                             if x.get("url")]
+                im = ((nd.get("image_versions2") or {}).get("candidates")) or []
+                img = im[0].get("url") if im else ""
+                capq = ""
+                try:
+                    capq = (nd["edge_media_to_caption"]["edges"][0]["node"]["text"] or "")
+                except Exception:
+                    capq = nd.get("caption") or ""
+                likes = (nd.get("edge_liked_by") or {}).get("count")
+                if likes is None:
+                    likes = nd.get("like_count")
+                ccount = (nd.get("edge_media_to_comment") or {}).get("count")
+                if ccount is None:
+                    ccount = nd.get("comment_count")
+                GRID_INFO[c] = {"video_urls": vurls, "image_url": img,
+                                "captions": [capq] if capq else [],
+                                "likes": likes, "taken_at": nd.get("taken_at"),
+                                "comments_count": ccount}
+                add(c, typ)
+            pi2 = cq.get("page_info") or {}
+            if not pi2.get("has_next_page"):
+                break
+            cursor = pi2.get("end_cursor")
+            if not cursor:
+                break
+            time.sleep(0.4)
+        print("PHASE1|QH total codes=%d" % len(codes), flush=True)
+
+    # discovery only needed if QH did not fill the grid
+    if seed and not codes:
         js_refs = []
         for u in re.findall(r'(?:src|href)=["\']([^"\']+\.js[^"\']*)["\']', seed):
             if u.startswith("//"): u = "https:" + u
@@ -714,7 +830,7 @@ def phase_profile_v4():
                 "__relay_internal_pv__PolarisShareSheetV3relayprovider": True}
     base_h = {"content-type": "application/x-www-form-urlencoded",
               "Accept-Language": "en-US,en;q=0.9", "Referer": PROFILE_URL}
-    variants = [
+    variants = [] if codes else [
         ("g12-noid", dict(**base_h), full_vars(12)),
         ("g12-app1", dict(**base_h, **{"x-ig-app-id": IG_APP_ID}), full_vars(12)),
         ("g12-app2", dict(**base_h, **{"x-ig-app-id": "936619743392459"}), full_vars(12)),
@@ -1020,6 +1136,8 @@ def phase_posts(codes):
                 for k in ("taken_at", "like_count", "comment_count"):
                     if post.get(k) is not None:
                         rec[k] = post[k]
+                if post.get("media_type") is not None:
+                    rec["media_type"] = post.get("media_type")
             cc = media.get("comments_connection")
             if not isinstance(cc, dict) and isinstance(post, dict):
                 cc = post.get("comments_connection")
